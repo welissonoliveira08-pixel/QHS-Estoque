@@ -1,0 +1,6 @@
+{
+  "name": "QHS Engenharia - Gestão de Estoque",
+  "description": "Sistema de gestão de estoque, almoxarifado, permissões granulares por funcionário e catálogo com fotos da QHS Engenharia.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
