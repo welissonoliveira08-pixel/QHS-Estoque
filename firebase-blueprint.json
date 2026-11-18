@@ -1,0 +1,870 @@
+{
+  "entities": {
+    "Admin": {
+      "title": "Admin",
+      "description": "Registro de administrador autorizado no sistema QHS Engenharia.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 200
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "name", "createdAt"]
+    },
+    "AuthorizedEmail": {
+      "title": "AuthorizedEmail",
+      "description": "Índice O(1) de controle de acesso de colaboradores ativos por e-mail.",
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "isAdmin": {
+          "type": "boolean"
+        },
+        "canDelete": {
+          "type": "boolean"
+        },
+        "userDocId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["active", "isAdmin", "userDocId", "createdAt", "updatedAt"]
+    },
+    "SystemSettings": {
+      "title": "SystemSettings",
+      "description": "Configurações institucionais e preferências visuais do almoxarifado QHS Engenharia.",
+      "type": "object",
+      "properties": {
+        "showProductPhotos": {
+          "type": "boolean"
+        },
+        "companyName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "companySubtitle": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "cnpj": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "contactEmail": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 150
+        },
+        "lowStockAlertNotification": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "showProductPhotos",
+        "companyName",
+        "companySubtitle",
+        "cnpj",
+        "contactEmail",
+        "lowStockAlertNotification",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ManagedLists": {
+      "title": "ManagedLists",
+      "description": "Listas dinâmicas centralizadas (grupos de produtos, cargos e obras de destino).",
+      "type": "object",
+      "properties": {
+        "groups": {
+          "type": "array",
+          "description": "Lista de grupos de produtos (ex: Materiais, Extintores, Placas)."
+        },
+        "roles": {
+          "type": "array",
+          "description": "Lista de cargos corporativos."
+        },
+        "destinations": {
+          "type": "array",
+          "description": "Lista de canteiros de obras e destinos."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["groups", "roles", "destinations", "createdAt", "updatedAt"]
+    },
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Perfil completo de colaborador com e-mail (PII restrita) e permissões individuais por aba.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 200
+        },
+        "role": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "department": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "isAdmin": {
+          "type": "boolean"
+        },
+        "canDelete": {
+          "type": "boolean"
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "permissions": {
+          "type": "object",
+          "description": "Permissões booleanas para as abas do aplicativo (incluindo colaboradores)."
+        },
+        "registrationDate": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "email",
+        "role",
+        "department",
+        "isAdmin",
+        "active",
+        "permissions",
+        "registrationDate",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StaffMember": {
+      "title": "StaffMember",
+      "description": "Diretório operacional sem PII para seleção de funcionário retirante nas movimentações.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orgId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "department": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "isAdmin": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "orgId", "name", "role", "department", "active", "isAdmin", "createdAt", "updatedAt"]
+    },
+    "Collaborator": {
+      "title": "Collaborator",
+      "description": "Cadastro de colaboradores de obra (sem login ou conta no aplicativo) para controle de retirada de materiais.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orgId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "registrationDate": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "displayUpdatedAt": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "orgId",
+        "fullName",
+        "active",
+        "registrationDate",
+        "displayUpdatedAt",
+        "ownerUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Produto cadastrado no almoxarifado QHS Engenharia.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orgId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "name": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 200
+        },
+        "group": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "currentStock": {
+          "type": "number"
+        },
+        "minStock": {
+          "type": "number"
+        },
+        "unitPrice": {
+          "type": "number"
+        },
+        "photoUrl": {
+          "type": "string",
+          "maxLength": 300000
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "registrationDate": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "displayUpdatedAt": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "orgId",
+        "code",
+        "name",
+        "group",
+        "currentStock",
+        "minStock",
+        "registrationDate",
+        "displayUpdatedAt",
+        "ownerUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StockMovement": {
+      "title": "StockMovement",
+      "description": "Registro de entrada ou saída de material com saldo pós-movimentação.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orgId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "productId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "productCode": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "productName": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "group": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "type": {
+          "type": "string",
+          "enum": ["ENTRADA", "SAIDA"]
+        },
+        "quantity": {
+          "type": "number"
+        },
+        "unitPrice": {
+          "type": "number"
+        },
+        "totalValue": {
+          "type": "number"
+        },
+        "stockAfterMovement": {
+          "type": "number"
+        },
+        "date": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "withdrawnBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "collaboratorId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "responsibleUser": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "destination": {
+          "type": "string",
+          "maxLength": 150
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "isNegativeStockAuthorized": {
+          "type": "boolean"
+        },
+        "authorizedBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "ownerUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "orgId",
+        "productId",
+        "productCode",
+        "productName",
+        "group",
+        "type",
+        "quantity",
+        "stockAfterMovement",
+        "date",
+        "responsibleUser",
+        "ownerUid",
+        "createdAt"
+      ]
+    },
+    "NegativeStockRequest": {
+      "title": "NegativeStockRequest",
+      "description": "Solicitação de saída excepcional com saldo negativo aguardando aprovação do administrador.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orgId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "productId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "productCode": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "productName": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "group": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "requestedQuantity": {
+          "type": "number"
+        },
+        "availableStock": {
+          "type": "number"
+        },
+        "deficitQuantity": {
+          "type": "number"
+        },
+        "withdrawnBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "collaboratorId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "destination": {
+          "type": "string",
+          "maxLength": 150
+        },
+        "requestedBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "requestedByUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "date": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDENTE", "APROVADO", "RECUSADO"]
+        },
+        "reviewedBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "reviewedAt": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "orgId",
+        "productId",
+        "productCode",
+        "productName",
+        "group",
+        "requestedQuantity",
+        "availableStock",
+        "deficitQuantity",
+        "withdrawnBy",
+        "destination",
+        "requestedBy",
+        "requestedByUid",
+        "reason",
+        "date",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DeletionRequest": {
+      "title": "DeletionRequest",
+      "description": "Solicitação de exclusão de registro enviada por colaborador sem permissão direta de exclusão.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orgId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "recordType": {
+          "type": "string",
+          "enum": ["PRODUTO", "ENTRADA", "SAIDA", "SOLICITACAO_NEGATIVA", "COLABORADOR"]
+        },
+        "targetId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "targetCode": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "targetName": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "targetDetails": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "quantity": {
+          "type": "number"
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "requestedBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "requestedByEmail": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "requestedByUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "date": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDENTE", "APROVADO", "RECUSADO"]
+        },
+        "reviewedBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "reviewedByEmail": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "reviewedAt": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "executedBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "executedAt": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "orgId",
+        "recordType",
+        "targetId",
+        "targetCode",
+        "targetName",
+        "targetDetails",
+        "quantity",
+        "reason",
+        "requestedBy",
+        "requestedByEmail",
+        "requestedByUid",
+        "date",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DeletionLog": {
+      "title": "DeletionLog",
+      "description": "Registro histórico e auditável de todas as exclusões executadas no sistema.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orgId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "origin": {
+          "type": "string",
+          "enum": ["DIRETA", "APROVADA"]
+        },
+        "requestId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "recordType": {
+          "type": "string",
+          "enum": ["PRODUTO", "ENTRADA", "SAIDA", "SOLICITACAO_NEGATIVA", "COLABORADOR"]
+        },
+        "targetId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "targetCode": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "targetName": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "targetDetails": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "quantity": {
+          "type": "number"
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "requestedBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "requestedByDate": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "approvedBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "approvedAt": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "deletedBy": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "deletedByEmail": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "deletedByUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "deletedAt": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "orgId",
+        "origin",
+        "recordType",
+        "targetId",
+        "targetCode",
+        "targetName",
+        "targetDetails",
+        "quantity",
+        "reason",
+        "requestedBy",
+        "requestedByDate",
+        "deletedBy",
+        "deletedByEmail",
+        "deletedByUid",
+        "deletedAt",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/Admin" },
+      "description": "Administradores provisionados com acesso pleno."
+    },
+    "/authorizedEmails/{emailKey}": {
+      "schema": { "$ref": "#/entities/AuthorizedEmail" },
+      "description": "Mapeamento de e-mails autorizados (chave em minúsculas) para verificação rápida de permissão."
+    },
+    "/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/SystemSettings" },
+      "description": "Configurações globais da empresa e exibição de fotos."
+    },
+    "/managedLists/{listId}": {
+      "schema": { "$ref": "#/entities/ManagedLists" },
+      "description": "Listas administradas de grupos, cargos e obras de destino."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Cadastro completo de colaboradores e suas permissões por aba (PII restrita)."
+    },
+    "/staffDirectory/{staffId}": {
+      "schema": { "$ref": "#/entities/StaffMember" },
+      "description": "Diretório público interno (sem PII) de usuários cadastrados."
+    },
+    "/collaborators/{collaboratorId}": {
+      "schema": { "$ref": "#/entities/Collaborator" },
+      "description": "Cadastro exclusivo de colaboradores das obras (sem login) para seleção e histórico de retiradas."
+    },
+    "/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Catálogo de materiais, extintores e placas do almoxarifado."
+    },
+    "/movements/{movementId}": {
+      "schema": { "$ref": "#/entities/StockMovement" },
+      "description": "Histórico imutável de entradas e saídas de estoque."
+    },
+    "/negativeRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/NegativeStockRequest" },
+      "description": "Solicitações de saída com saldo negativo para análise do administrador."
+    },
+    "/deletionRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/DeletionRequest" },
+      "description": "Solicitações de exclusão de registros aguardando aprovação do administrador."
+    },
+    "/deletionLogs/{logId}": {
+      "schema": { "$ref": "#/entities/DeletionLog" },
+      "description": "Histórico auditável de exclusões realizadas no sistema."
+    }
+  }
+}

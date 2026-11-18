@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useRef } from 'react';
 import { useApp } from '../../context/AppContext';
 import { Product } from '../../types';
+import { DeletionActionModal, DeletionTarget } from '../DeletionActionModal';
 import {
   Search,
   Plus,
@@ -16,6 +17,7 @@ import {
   Layers,
   ZoomIn,
   Calendar,
+  CheckCircle2,
 } from 'lucide-react';
 
 const PRESET_QHS_PHOTOS = [
@@ -43,6 +45,9 @@ export const ProductsTab: React.FC = () => {
     addProduct,
     updateProduct,
     deleteProduct,
+    canDeleteDirectly,
+    deletionRequests,
+    createDeletionRequest,
     settings,
     updateSettings,
     setSelectedProductForModal,
@@ -59,14 +64,23 @@ export const ProductsTab: React.FC = () => {
   // Modal State
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [productToDelete, setProductToDelete] = useState<Product | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  // Form State (strictly the required fields only: code, name, group, currentStock, minStock, createdAt, photoUrl, description)
+  const pendingDeletionIds = useMemo(
+    () => new Set(deletionRequests.filter((r) => r.status === 'PENDENTE').map((r) => r.targetId)),
+    [deletionRequests]
+  );
+
+  // Form State (strings for numeric fields so users can freely erase/edit without "0" getting stuck)
   const [formData, setFormData] = useState({
     code: '',
     name: '',
     group: managedLists.groups[0] || 'Materiais',
-    currentStock: 0,
-    minStock: 5,
+    currentStock: '',
+    minStock: '',
     createdAt: '',
     photoUrl: '',
     description: '',
@@ -113,29 +127,18 @@ export const ProductsTab: React.FC = () => {
       });
   }, [products, searchQuery, selectedGroup, filterLowStockOnly, sortBy, sortOrder]);
 
-  const generateAutoCode = (groupName: string) => {
-    let prefix = 'MAT';
-    const gUpper = groupName.toUpperCase();
-    if (gUpper.includes('EXTINTOR')) prefix = 'EXT';
-    else if (gUpper.includes('PLACA')) prefix = 'PLA';
-    else prefix = groupName.slice(0, 3).toUpperCase();
-
-    const countSamePrefix = products.filter((p) => p.code.includes(`QHS-${prefix}`)).length;
-    return `QHS-${prefix}-${String(countSamePrefix + 101).padStart(3, '0')}`;
-  };
-
   const handleOpenAdd = () => {
     const initialGroup = managedLists.groups[0] || 'Materiais';
-    const autoCode = generateAutoCode(initialGroup);
     const today = new Date().toISOString().split('T')[0];
 
     setEditingProduct(null);
+    setFormError(null);
     setFormData({
-      code: autoCode,
+      code: '',
       name: '',
       group: initialGroup,
-      currentStock: 0,
-      minStock: 5,
+      currentStock: '',
+      minStock: '',
       createdAt: today,
       photoUrl: '',
       description: '',
@@ -147,19 +150,18 @@ export const ProductsTab: React.FC = () => {
     setFormData((prev) => ({
       ...prev,
       group: newGroup,
-      // If adding new product and code hasn't been manually altered, update prefix
-      code: editingProduct ? prev.code : generateAutoCode(newGroup),
     }));
   };
 
   const handleOpenEdit = (product: Product) => {
     setEditingProduct(product);
+    setFormError(null);
     setFormData({
       code: product.code,
       name: product.name,
       group: product.group,
-      currentStock: product.currentStock,
-      minStock: product.minStock,
+      currentStock: String(product.currentStock),
+      minStock: String(product.minStock),
       createdAt: product.createdAt,
       photoUrl: product.photoUrl || '',
       description: product.description || '',
@@ -169,28 +171,64 @@ export const ProductsTab: React.FC = () => {
 
   const handleSaveProduct = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.name.trim() || !formData.code.trim()) {
+    setFormError(null);
+
+    const trimmedCode = formData.code.trim();
+    const trimmedName = formData.name.trim();
+
+    if (!trimmedCode) {
+      setFormError('Digite o código identificador do produto.');
+      return;
+    }
+    if (trimmedName.length < 2) {
+      setFormError('Informe um nome de produto com pelo menos 2 caracteres.');
+      return;
+    }
+    if (formData.currentStock.trim() === '' || formData.currentStock === '-') {
+      setFormError('Informe a quantidade em estoque atual.');
+      return;
+    }
+    if (formData.minStock.trim() === '') {
+      setFormError('Informe o estoque mínimo de segurança.');
+      return;
+    }
+
+    const duplicateCode = products.some(
+      (p) =>
+        p.code.trim().toLowerCase() === trimmedCode.toLowerCase() &&
+        p.id !== editingProduct?.id
+    );
+    if (duplicateCode) {
+      setFormError(`Já existe um produto cadastrado com o código "${trimmedCode}". Escolha outro código.`);
+      return;
+    }
+
+    const parsedCurrentStock = Number(formData.currentStock);
+    const parsedMinStock = Math.max(0, Number(formData.minStock));
+
+    if (Number.isNaN(parsedCurrentStock) || Number.isNaN(parsedMinStock)) {
+      setFormError('Informe quantidades numéricas válidas.');
       return;
     }
 
     if (editingProduct) {
       updateProduct({
         ...editingProduct,
-        code: formData.code,
-        name: formData.name,
+        code: trimmedCode,
+        name: trimmedName,
         group: formData.group,
-        currentStock: Number(formData.currentStock),
-        minStock: Number(formData.minStock),
+        currentStock: parsedCurrentStock,
+        minStock: parsedMinStock,
         photoUrl: formData.photoUrl,
         description: formData.description,
       });
     } else {
       addProduct({
-        code: formData.code,
-        name: formData.name,
+        code: trimmedCode,
+        name: trimmedName,
         group: formData.group,
-        currentStock: Number(formData.currentStock),
-        minStock: Number(formData.minStock),
+        currentStock: Math.max(0, parsedCurrentStock),
+        minStock: parsedMinStock,
         photoUrl: formData.photoUrl,
         description: formData.description,
       });
@@ -200,16 +238,83 @@ export const ProductsTab: React.FC = () => {
   };
 
   const handleDelete = (product: Product) => {
-    if (
-      window.confirm(
-        `Confirma a exclusão do produto "${product.name}" (${product.code}) do catálogo?`
-      )
-    ) {
-      deleteProduct(product.id);
-    }
+    setProductToDelete(product);
   };
 
-  // Image Upload Handler with Canvas Downsampling
+  const handleConfirmDelete = async () => {
+    if (!productToDelete || isDeleting) return;
+    setIsDeleting(true);
+    const target = productToDelete;
+    const res = await deleteProduct(target.id);
+    setIsDeleting(false);
+    setProductToDelete(null);
+
+    if (res.success) {
+      setFeedback({
+        type: 'success',
+        message: `Produto "${target.name}" (${target.code}) excluído com sucesso.`,
+      });
+    } else {
+      setFeedback({
+        type: 'error',
+        message: res.message || 'Não foi possível excluir o produto.',
+      });
+    }
+    setTimeout(() => setFeedback(null), 5000);
+  };
+
+  const handleRequestDeleteProduct = async (reason: string) => {
+    if (!productToDelete || isDeleting) return;
+    setIsDeleting(true);
+    const target = productToDelete;
+    const res = await createDeletionRequest({
+      recordType: 'PRODUTO',
+      targetId: target.id,
+      targetCode: target.code,
+      targetName: target.name,
+      targetDetails: `Grupo: ${target.group} · Estoque atual: ${target.currentStock} un (Mín: ${target.minStock} un)`,
+      quantity: target.currentStock,
+      reason,
+    });
+    setIsDeleting(false);
+    setProductToDelete(null);
+
+    setFeedback({
+      type: res.success ? 'success' : 'error',
+      message:
+        res.message ||
+        (res.success
+          ? 'Solicitação de exclusão enviada ao Administrador.'
+          : 'Erro ao solicitar exclusão.'),
+    });
+    setTimeout(() => setFeedback(null), 6000);
+  };
+
+  const deletionModalTarget: DeletionTarget | null = productToDelete
+    ? {
+        recordType: 'PRODUTO',
+        targetId: productToDelete.id,
+        targetCode: productToDelete.code,
+        targetName: productToDelete.name,
+        targetDetails: `Grupo: ${productToDelete.group} · Estoque atual: ${productToDelete.currentStock} un`,
+        quantity: productToDelete.currentStock,
+        modalTitle: 'Confirmar Exclusão de Produto',
+        summaryText: (
+          <>
+            {canDeleteDirectly ? 'Tem certeza que deseja excluir o produto ' : 'Solicitar exclusão do produto '}
+            <strong className="text-zinc-900">"{productToDelete.name}"</strong>{' '}
+            (<span className="font-mono font-semibold">{productToDelete.code}</span>) do catálogo?
+          </>
+        ),
+        stockImpactWarning: (
+          <span>
+            Esta ação removerá o produto por completo de todo o aplicativo, apagando também todas as entradas, saídas, solicitações e estatísticas vinculadas a ele.
+          </span>
+        ),
+      }
+    : null;
+
+  // Image Upload Handler with Canvas Downsampling (guaranteed <= 280KB for Firestore)
   const handleImageFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -219,7 +324,7 @@ export const ProductsTab: React.FC = () => {
       const img = new Image();
       img.onload = () => {
         const canvas = document.createElement('canvas');
-        const MAX_WIDTH = 600;
+        const MAX_WIDTH = 480;
         const scaleSize = MAX_WIDTH / img.width;
         canvas.width = Math.min(img.width, MAX_WIDTH);
         canvas.height = img.width > MAX_WIDTH ? img.height * scaleSize : img.height;
@@ -227,8 +332,13 @@ export const ProductsTab: React.FC = () => {
         const ctx = canvas.getContext('2d');
         if (ctx) {
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
-          setFormData((prev) => ({ ...prev, photoUrl: dataUrl }));
+          let quality = 0.8;
+          let dataUrl = canvas.toDataURL('image/jpeg', quality);
+          while (dataUrl.length > 280000 && quality > 0.2) {
+            quality -= 0.15;
+            dataUrl = canvas.toDataURL('image/jpeg', quality);
+          }
+          setFormData((prev) => ({ ...prev, photoUrl: dataUrl.slice(0, 290000) }));
         }
       };
       if (event.target?.result) {
@@ -251,7 +361,7 @@ export const ProductsTab: React.FC = () => {
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
           {/* Quick toggle for Photos */}
           <button
             onClick={() => updateSettings({ showProductPhotos: !settings.showProductPhotos })}
@@ -278,13 +388,39 @@ export const ProductsTab: React.FC = () => {
           {/* New Product Button */}
           <button
             onClick={handleOpenAdd}
-            className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
+            className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
           >
             <Plus className="w-4 h-4" />
             Cadastrar Produto
           </button>
         </div>
       </div>
+
+      {feedback && (
+        <div
+          className={`p-3.5 rounded-xl flex items-center justify-between gap-2 text-xs font-medium border ${
+            feedback.type === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+              : 'bg-red-50 border-red-200 text-red-800'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {feedback.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+            )}
+            <span>{feedback.message}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setFeedback(null)}
+            className="text-zinc-500 hover:text-zinc-800"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Search & Filter Toolbar */}
       <div className="bg-white p-4 rounded-xl border border-zinc-200 shadow-xs space-y-3">
@@ -344,7 +480,7 @@ export const ProductsTab: React.FC = () => {
         </div>
 
         {/* Results Info & Order */}
-        <div className="flex items-center justify-between pt-2 border-t border-zinc-100 text-xs text-zinc-500">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-2 border-t border-zinc-100 text-xs text-zinc-500">
           <div>
             <span>Exibindo </span>
             <strong className="text-zinc-800 font-mono tabular-nums">
@@ -366,7 +502,7 @@ export const ProductsTab: React.FC = () => {
                 setSortBy(sb);
                 setSortOrder(so);
               }}
-              className="text-xs border border-zinc-200 rounded px-2 py-1 bg-white text-zinc-700"
+              className="flex-1 sm:flex-none text-xs border border-zinc-200 rounded px-2 py-1 bg-white text-zinc-700"
             >
               <option value="name-asc">Nome (A - Z)</option>
               <option value="name-desc">Nome (Z - A)</option>
@@ -378,8 +514,126 @@ export const ProductsTab: React.FC = () => {
         </div>
       </div>
 
-      {/* Products Table (Code, Name, Group, Current Stock, Min Stock, Photos) */}
-      <div className="bg-white border border-zinc-200 rounded-xl overflow-hidden shadow-xs">
+      {/* Mobile Cards View (< md) */}
+      <div className="md:hidden space-y-3">
+        {filteredProducts.length === 0 ? (
+          <div className="bg-white border border-zinc-200 rounded-xl p-8 text-center text-zinc-400">
+            <Layers className="w-10 h-10 mx-auto text-zinc-300 stroke-1 mb-2" />
+            <p className="text-sm font-semibold text-zinc-600">Nenhum produto encontrado</p>
+            <p className="text-xs text-zinc-400 mt-1">
+              Cadastre um produto ou ajuste a busca e o filtro de grupo.
+            </p>
+          </div>
+        ) : (
+          filteredProducts.map((product) => {
+            const isBelowMin = product.currentStock <= product.minStock;
+            return (
+              <div
+                key={product.id}
+                className="bg-white border border-zinc-200 rounded-xl p-4 shadow-xs space-y-3"
+              >
+                <div className="flex items-start gap-3">
+                  {settings.showProductPhotos && (
+                    <div className="shrink-0">
+                      {product.photoUrl ? (
+                        <button
+                          onClick={() => setSelectedProductForModal(product)}
+                          className="w-14 h-14 rounded-lg overflow-hidden border border-zinc-200 bg-zinc-100 block"
+                        >
+                          <img
+                            src={product.photoUrl}
+                            alt={product.name}
+                            referrerPolicy="no-referrer"
+                            className="w-full h-full object-cover"
+                          />
+                        </button>
+                      ) : (
+                        <div className="w-14 h-14 rounded-lg border border-dashed border-zinc-300 bg-zinc-50 flex flex-col items-center justify-center text-zinc-400">
+                          <Camera className="w-4 h-4 text-zinc-300" />
+                          <span className="text-[9px]">S/ Foto</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="flex-1 min-w-0">
+                    <div className="flex flex-wrap items-center gap-1.5 mb-1">
+                      <span className="bg-zinc-100 text-zinc-800 px-2 py-0.5 rounded border border-zinc-200 text-[11px] font-mono font-semibold">
+                        {product.code}
+                      </span>
+                      <span className="px-2 py-0.5 bg-zinc-100 rounded text-zinc-700 text-[11px] font-medium">
+                        {product.group}
+                      </span>
+                    </div>
+                    <h3 className="text-xs font-bold text-zinc-900 leading-snug break-words">
+                      {product.name}
+                    </h3>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between pt-2.5 border-t border-zinc-100">
+                  <div className="flex items-center gap-4 text-xs">
+                    <div>
+                      <span className="text-[10px] text-zinc-400 block">Estoque Atual</span>
+                      <span
+                        className={`font-mono font-bold tabular-nums inline-flex items-center gap-1 ${
+                          isBelowMin ? 'text-red-600' : 'text-zinc-900'
+                        }`}
+                      >
+                        {isBelowMin && <AlertTriangle className="w-3 h-3 text-red-600" />}
+                        {product.currentStock} un
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-zinc-400 block">Mínimo</span>
+                      <span className="font-mono text-zinc-600 tabular-nums">{product.minStock} un</span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1">
+                    {product.photoUrl && (
+                      <button
+                        onClick={() => setSelectedProductForModal(product)}
+                        className="p-2 text-zinc-500 hover:text-zinc-900 hover:bg-zinc-100 rounded-lg"
+                        title="Ver detalhes e foto"
+                      >
+                        <Eye className="w-4 h-4" />
+                      </button>
+                    )}
+                    <button
+                      onClick={() => handleOpenEdit(product)}
+                      className="p-2 text-zinc-500 hover:text-zinc-900 hover:bg-zinc-100 rounded-lg"
+                      title="Editar produto"
+                    >
+                      <Edit2 className="w-4 h-4" />
+                    </button>
+                    <button
+                      onClick={() => handleDelete(product)}
+                      className={`p-2 rounded-lg transition-colors ${
+                        pendingDeletionIds.has(product.id)
+                          ? 'text-amber-600 bg-amber-50'
+                          : 'text-zinc-400 hover:text-red-600 hover:bg-red-50'
+                      }`}
+                      title={
+                        pendingDeletionIds.has(product.id)
+                          ? 'Solicitação de exclusão pendente'
+                          : canDeleteDirectly
+                          ? 'Excluir produto'
+                          : 'Solicitar exclusão'
+                      }
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* Desktop Products Table (md+) */}
+      <div className="hidden md:block bg-white border border-zinc-200 rounded-xl overflow-hidden shadow-xs">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
             <thead className="bg-zinc-900 text-zinc-200 font-semibold uppercase tracking-wider text-[11px]">
@@ -513,8 +767,18 @@ export const ProductsTab: React.FC = () => {
                           </button>
                           <button
                             onClick={() => handleDelete(product)}
-                            className="p-1.5 text-zinc-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
-                            title="Excluir produto"
+                            className={`p-1.5 rounded-md transition-colors ${
+                              pendingDeletionIds.has(product.id)
+                                ? 'text-amber-600 bg-amber-50'
+                                : 'text-zinc-400 hover:text-red-600 hover:bg-red-50'
+                            }`}
+                            title={
+                              pendingDeletionIds.has(product.id)
+                                ? 'Solicitação de exclusão pendente'
+                                : canDeleteDirectly
+                                ? 'Excluir produto'
+                                : 'Solicitar exclusão'
+                            }
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -551,11 +815,18 @@ export const ProductsTab: React.FC = () => {
 
             {/* Modal Form */}
             <form onSubmit={handleSaveProduct} className="p-6 space-y-4">
+              {formError && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800 font-medium flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{formError}</span>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                {/* 1. Código Automático */}
+                {/* 1. Código Manual */}
                 <div>
                   <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                    Código do Produto (Automático) *
+                    Código do Produto *
                   </label>
                   <input
                     type="text"
@@ -563,10 +834,10 @@ export const ProductsTab: React.FC = () => {
                     value={formData.code}
                     onChange={(e) => setFormData({ ...formData, code: e.target.value })}
                     className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 font-mono font-semibold"
-                    placeholder="Ex: QHS-EXT-101"
+                    placeholder="Ex: COD-001, EXT-01..."
                   />
                   <span className="text-[10px] text-zinc-400 mt-0.5 block">
-                    Gerado automaticamente conforme o grupo selecionado.
+                    Digite manualmente o código identificador do produto.
                   </span>
                 </div>
 
@@ -606,36 +877,42 @@ export const ProductsTab: React.FC = () => {
                   />
                 </div>
 
-                {/* 4. Estoque Atual */}
+                {/* 4. Estoque Atual (digitável livremente, sem setas) */}
                 <div>
                   <label className="block text-xs font-semibold text-zinc-700 mb-1">
                     Estoque Atual (Unidades) *
                   </label>
                   <input
-                    type="number"
-                    min="0"
+                    type="text"
+                    inputMode="numeric"
                     required
                     value={formData.currentStock}
-                    onChange={(e) =>
-                      setFormData({ ...formData, currentStock: Number(e.target.value) })
-                    }
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      const sanitized = editingProduct
+                        ? raw.replace(/(?!^-)\D/g, '').replace(/^(-?)(.*)/, (_, sign, rest) => sign + rest.replace(/-/g, ''))
+                        : raw.replace(/\D/g, '');
+                      setFormData({ ...formData, currentStock: sanitized });
+                    }}
+                    placeholder="Ex: 10"
                     className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 font-mono tabular-nums font-bold"
                   />
                 </div>
 
-                {/* 5. Estoque Mínimo */}
+                {/* 5. Estoque Mínimo (digitável livremente, sem setas) */}
                 <div>
                   <label className="block text-xs font-semibold text-zinc-700 mb-1">
                     Estoque Mínimo de Segurança *
                   </label>
                   <input
-                    type="number"
-                    min="1"
+                    type="text"
+                    inputMode="numeric"
                     required
                     value={formData.minStock}
                     onChange={(e) =>
-                      setFormData({ ...formData, minStock: Number(e.target.value) })
+                      setFormData({ ...formData, minStock: e.target.value.replace(/\D/g, '') })
                     }
+                    placeholder="Ex: 5"
                     className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 font-mono tabular-nums font-bold"
                   />
                 </div>
@@ -783,6 +1060,18 @@ export const ProductsTab: React.FC = () => {
           </div>
         </div>
       )}
+
+      <DeletionActionModal
+        target={deletionModalTarget}
+        canDeleteDirectly={canDeleteDirectly}
+        hasPendingRequest={
+          productToDelete ? pendingDeletionIds.has(productToDelete.id) : false
+        }
+        isSubmitting={isDeleting}
+        onClose={() => setProductToDelete(null)}
+        onConfirmDirectDelete={handleConfirmDelete}
+        onSubmitRequest={handleRequestDeleteProduct}
+      />
     </div>
   );
 };

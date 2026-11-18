@@ -10,8 +10,9 @@ import {
   BarChart3,
   Settings,
   ShieldAlert,
-  AlertTriangle,
   UserCheck,
+  Users,
+  X,
 } from 'lucide-react';
 
 interface NavItem {
@@ -47,6 +48,12 @@ const ALL_NAV_ITEMS: NavItem[] = [
     icon: ArrowUpRight,
   },
   {
+    id: 'colaboradores',
+    label: 'Colaboradores',
+    description: 'Funcionários de obra e retiradas',
+    icon: Users,
+  },
+  {
     id: 'relatorios',
     label: 'Relatórios',
     description: 'Extratos e balanços de estoque',
@@ -66,14 +73,17 @@ const ALL_NAV_ITEMS: NavItem[] = [
   },
 ];
 
-export const Sidebar: React.FC = () => {
+interface SidebarProps {
+  mobileOpen?: boolean;
+  onCloseMobile?: () => void;
+}
+
+export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen = false, onCloseMobile }) => {
   const {
     activeTab,
     setActiveTab,
     canAccessTab,
     currentUser,
-    products,
-    availableTabsForCurrentUser,
   } = useApp();
 
   // Filtrar apenas as abas autorizadas para o usuário logado
@@ -81,12 +91,39 @@ export const Sidebar: React.FC = () => {
     canAccessTab(item.id, currentUser)
   );
 
-  // Contagem de itens com estoque baixo para sinalização preventiva
-  const lowStockCount = products.filter((p) => p.currentStock <= p.minStock).length;
+  const handleSelectTab = (tab: TabId) => {
+    setActiveTab(tab);
+    onCloseMobile?.();
+  };
 
-  return (
-    <aside className="w-64 shrink-0 bg-zinc-950 text-zinc-300 border-r border-zinc-800 flex flex-col justify-between select-none">
-      <div className="p-4 space-y-6">
+  const sidebarContent = (
+    <div className="flex flex-col justify-between h-full">
+      <div className="p-4 space-y-6 overflow-y-auto">
+        {/* Mobile Drawer Header */}
+        <div className="flex items-center justify-between lg:hidden pb-3 border-b border-zinc-800">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 bg-red-600 rounded-lg flex items-center justify-center text-white font-black text-xs border border-red-500">
+              QHS
+            </div>
+            <div>
+              <div className="text-xs font-extrabold text-white leading-none">
+                QHS <span className="text-red-500">ENGENHARIA</span>
+              </div>
+              <div className="text-[10px] text-zinc-400 mt-0.5">Menu de Navegação</div>
+            </div>
+          </div>
+          {onCloseMobile && (
+            <button
+              type="button"
+              onClick={onCloseMobile}
+              aria-label="Fechar menu"
+              className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-900"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          )}
+        </div>
+
         {/* Navigation Section */}
         <div>
           <div className="px-3 pb-2 text-[11px] font-bold text-zinc-500 uppercase tracking-wider flex items-center justify-between">
@@ -100,19 +137,18 @@ export const Sidebar: React.FC = () => {
             {allowedNavItems.map((item) => {
               const Icon = item.icon;
               const isActive = activeTab === item.id;
-              const isProducts = item.id === 'produtos';
 
               return (
                 <button
                   key={item.id}
-                  onClick={() => setActiveTab(item.id)}
+                  onClick={() => handleSelectTab(item.id)}
                   className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-xs font-medium transition-all group ${
                     isActive
                       ? 'bg-red-600 text-white shadow-xs font-semibold'
                       : 'text-zinc-300 hover:text-white hover:bg-zinc-900'
                   }`}
                 >
-                  <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
                     <Icon
                       className={`w-4 h-4 shrink-0 transition-transform ${
                         isActive
@@ -122,19 +158,6 @@ export const Sidebar: React.FC = () => {
                     />
                     <span className="truncate">{item.label}</span>
                   </div>
-
-                  {isProducts && lowStockCount > 0 && (
-                    <span
-                      title={`${lowStockCount} produtos abaixo do estoque mínimo`}
-                      className={`font-mono text-[10px] px-1.5 py-0.5 rounded-full font-bold tabular-nums ${
-                        isActive
-                          ? 'bg-white text-red-600'
-                          : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
-                      }`}
-                    >
-                      {lowStockCount}
-                    </span>
-                  )}
                 </button>
               );
             })}
@@ -156,7 +179,7 @@ export const Sidebar: React.FC = () => {
       </div>
 
       {/* User profile footer */}
-      <div className="p-4 border-t border-zinc-800/80 bg-zinc-900/40">
+      <div className="p-4 border-t border-zinc-800/80 bg-zinc-900/40 shrink-0">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-full bg-zinc-800 border border-zinc-700 flex items-center justify-center font-bold text-xs text-white shrink-0">
             {currentUser.name.charAt(0)}
@@ -171,12 +194,34 @@ export const Sidebar: React.FC = () => {
                   <UserCheck className="w-3 h-3" /> Admin Total
                 </span>
               ) : (
-                <span>{currentUser.role}</span>
+                <span className="truncate">{currentUser.role}</span>
               )}
             </div>
           </div>
         </div>
       </div>
-    </aside>
+    </div>
+  );
+
+  return (
+    <>
+      {/* Desktop persistent sidebar */}
+      <aside className="hidden lg:flex w-64 shrink-0 bg-zinc-950 text-zinc-300 border-r border-zinc-800 flex-col select-none print:hidden">
+        {sidebarContent}
+      </aside>
+
+      {/* Mobile & Tablet slide-over drawer */}
+      {mobileOpen && (
+        <div className="fixed inset-0 z-50 lg:hidden flex print:hidden" role="dialog" aria-modal="true">
+          <div
+            className="fixed inset-0 bg-black/70 backdrop-blur-xs"
+            onClick={onCloseMobile}
+          />
+          <aside className="relative z-10 w-72 max-w-[82vw] bg-zinc-950 text-zinc-300 border-r border-zinc-800 flex flex-col h-full shadow-2xl select-none">
+            {sidebarContent}
+          </aside>
+        </div>
+      )}
+    </>
   );
 };

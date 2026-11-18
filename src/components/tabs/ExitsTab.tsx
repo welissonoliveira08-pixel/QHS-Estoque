@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
-import { Product } from '../../types';
+import { NegativeStockRequest, Product, StockMovement } from '../../types';
+import { DeletionActionModal, DeletionTarget } from '../DeletionActionModal';
 import {
   ArrowUpRight,
   Plus,
@@ -11,9 +12,9 @@ import {
   X,
   User,
   ShieldAlert,
-  Clock,
   Layers,
   Send,
+  Trash2,
 } from 'lucide-react';
 
 export const ExitsTab: React.FC = () => {
@@ -21,25 +22,40 @@ export const ExitsTab: React.FC = () => {
     products,
     movements,
     addMovement,
+    deleteMovement,
+    canDeleteDirectly,
+    deletionRequests,
+    createDeletionRequest,
     currentUser,
-    users,
+    collaborators,
+    setActiveTab,
     managedLists,
     negativeRequests,
     createNegativeStockRequest,
     approveNegativeStockRequest,
     rejectNegativeStockRequest,
+    deleteNegativeStockRequest,
   } = useApp();
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [searchFilter, setSearchFilter] = useState('');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [exitToDelete, setExitToDelete] = useState<StockMovement | null>(null);
+  const [requestToDelete, setRequestToDelete] = useState<NegativeStockRequest | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
-  // Form State (strictly: Data, Produto inteligente, Quantidade, Funcionário que retirou, Destino/Obra, Observações)
+  const pendingDeletionIds = useMemo(
+    () => new Set(deletionRequests.filter((r) => r.status === 'PENDENTE').map((r) => r.targetId)),
+    [deletionRequests]
+  );
+
+  // Form State (strings for numeric fields so users can clear & type freely without spinners)
   const [formData, setFormData] = useState({
     productId: '',
-    quantity: 1,
-    withdrawnBy: '',
-    destination: managedLists.destinations[0] || 'Canteiro Central QHS',
+    quantity: '',
+    collaboratorId: '',
+    destination: managedLists.destinations[0] || '',
     date: '',
     notes: '',
   });
@@ -86,23 +102,29 @@ export const ExitsTab: React.FC = () => {
     });
   }, [products, productSearchInput]);
 
-  // Active employees for the "Funcionário que retirou o material" select
-  const activeEmployees = useMemo(() => {
-    return users.filter((u) => u.active);
-  }, [users]);
+  // Active non-login field collaborators for the "Colaborador que retirou" select
+  const activeCollaborators = useMemo(() => {
+    return [...collaborators]
+      .filter((c) => c.active)
+      .sort((a, b) => a.fullName.localeCompare(b.fullName, 'pt-BR'));
+  }, [collaborators]);
+
+  const selectedCollaborator = useMemo(() => {
+    return activeCollaborators.find((c) => c.id === formData.collaboratorId) || null;
+  }, [activeCollaborators, formData.collaboratorId]);
 
   const handleOpenAdd = () => {
     const now = new Date();
     const formattedDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
     const firstProd = products[0];
-    const defaultWithdrawn = activeEmployees[0]?.name || currentUser.name;
+    setFormError(null);
 
     setFormData({
       productId: firstProd ? firstProd.id : '',
-      quantity: 1,
-      withdrawnBy: defaultWithdrawn,
-      destination: managedLists.destinations[0] || 'Canteiro Central QHS',
+      quantity: '',
+      collaboratorId: '',
+      destination: managedLists.destinations[0] || '',
       date: formattedDate,
       notes: '',
     });
@@ -112,15 +134,31 @@ export const ExitsTab: React.FC = () => {
   };
 
   const handleSelectProduct = (prod: Product) => {
-    setFormData((prev) => ({ ...prev, productId: prod.id }));
+    setFormData((prev) => ({
+      ...prev,
+      productId: prod.id,
+    }));
     // Do NOT show the current stock quantity next to the product name during product selection
     setProductSearchInput(`${prod.code} - ${prod.name}`);
     setIsProductDropdownOpen(false);
   };
 
+  const parsedQuantity = Number(formData.quantity) || 0;
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.productId || formData.quantity <= 0 || !formData.withdrawnBy) {
+    setFormError(null);
+
+    if (!formData.productId) {
+      setFormError('Selecione um produto na lista.');
+      return;
+    }
+    if (!selectedCollaborator) {
+      setFormError('Selecione o colaborador que retirou o material.');
+      return;
+    }
+    if (!formData.quantity.trim() || Number.isNaN(parsedQuantity) || parsedQuantity <= 0) {
+      setFormError('Informe uma quantidade maior que zero.');
       return;
     }
 
@@ -128,10 +166,9 @@ export const ExitsTab: React.FC = () => {
     if (!prod) return;
 
     // RULE: If requested quantity > available stock, block normal exit and offer Admin authorization
-    if (prod.currentStock < formData.quantity) {
-      // Open Solicitation Modal
+    if (prod.currentStock < parsedQuantity) {
       setSolicitationReason(
-        `Solicitação de saída de ${formData.quantity} un de ${prod.name} para a obra "${formData.destination}". Saldo disponível: ${prod.currentStock} un.`
+        `Solicitação de saída de ${parsedQuantity} un de ${prod.name} para a obra "${formData.destination}". Saldo disponível: ${prod.currentStock} un.`
       );
       setIsSolicitationModalOpen(true);
       return;
@@ -140,9 +177,10 @@ export const ExitsTab: React.FC = () => {
     const res = addMovement({
       productId: prod.id,
       type: 'SAIDA',
-      quantity: Number(formData.quantity),
+      quantity: parsedQuantity,
       date: formData.date,
-      withdrawnBy: formData.withdrawnBy,
+      withdrawnBy: selectedCollaborator.fullName,
+      collaboratorId: selectedCollaborator.id,
       destination: formData.destination,
       notes: formData.notes,
     });
@@ -150,7 +188,7 @@ export const ExitsTab: React.FC = () => {
     if (res.success) {
       setFeedback({
         type: 'success',
-        message: `Saída de ${formData.quantity} un de "${prod.name}" para "${formData.destination}" registrada! Saldo restante: ${res.stockAfter} un.`,
+        message: `Saída de ${parsedQuantity} un de "${prod.name}" retirada por ${selectedCollaborator.fullName} para "${formData.destination}" registrada! Saldo restante: ${res.stockAfter} un.`,
       });
       setTimeout(() => setFeedback(null), 5000);
       setIsModalOpen(false);
@@ -164,12 +202,13 @@ export const ExitsTab: React.FC = () => {
 
   const handleSendSolicitation = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.productId || !selectedProduct) return;
+    if (!formData.productId || !selectedProduct || !selectedCollaborator || parsedQuantity <= 0) return;
 
     const res = createNegativeStockRequest({
       productId: selectedProduct.id,
-      requestedQuantity: Number(formData.quantity),
-      withdrawnBy: formData.withdrawnBy,
+      requestedQuantity: parsedQuantity,
+      withdrawnBy: selectedCollaborator.fullName,
+      collaboratorId: selectedCollaborator.id,
       destination: formData.destination,
       reason: solicitationReason,
     });
@@ -185,6 +224,154 @@ export const ExitsTab: React.FC = () => {
     }
   };
 
+  const handleConfirmDeleteExit = async () => {
+    if (!exitToDelete || isDeleting) return;
+    setIsDeleting(true);
+    const target = exitToDelete;
+    const res = await deleteMovement(target.id);
+    setIsDeleting(false);
+    setExitToDelete(null);
+
+    if (res.success) {
+      const stockInfo =
+        res.productUpdated && res.newStock !== undefined
+          ? ` Estoque atual de "${target.productName}": ${res.newStock} un.`
+          : '';
+      setFeedback({
+        type: 'success',
+        message: `Saída de ${target.quantity} un de "${target.productName}" excluída com sucesso.${stockInfo}`,
+      });
+      setTimeout(() => setFeedback(null), 6000);
+    } else {
+      setFeedback({
+        type: 'error',
+        message: res.message || 'Erro ao excluir o registro de saída.',
+      });
+    }
+  };
+
+  const handleRequestDeleteExit = async (reason: string) => {
+    if (!exitToDelete || isDeleting) return;
+    setIsDeleting(true);
+    const target = exitToDelete;
+    const res = await createDeletionRequest({
+      recordType: 'SAIDA',
+      targetId: target.id,
+      targetCode: target.productCode,
+      targetName: target.productName,
+      targetDetails: `Saída em ${target.date} · Retirado por: ${target.withdrawnBy || '-'} · Obra: ${target.destination || '-'}`,
+      quantity: target.quantity,
+      reason,
+    });
+    setIsDeleting(false);
+    setExitToDelete(null);
+
+    setFeedback({
+      type: res.success ? 'success' : 'error',
+      message:
+        res.message ||
+        (res.success
+          ? 'Solicitação de exclusão enviada ao Administrador.'
+          : 'Erro ao solicitar exclusão.'),
+    });
+    setTimeout(() => setFeedback(null), 6000);
+  };
+
+  const handleConfirmDeleteRequest = async () => {
+    if (!requestToDelete || isDeleting) return;
+    setIsDeleting(true);
+    const target = requestToDelete;
+    const res = await deleteNegativeStockRequest(target.id);
+    setIsDeleting(false);
+    setRequestToDelete(null);
+
+    if (res.success) {
+      setFeedback({
+        type: 'success',
+        message: `Solicitação de estoque negativo do produto "${target.productName}" excluída com sucesso.`,
+      });
+      setTimeout(() => setFeedback(null), 5000);
+    } else {
+      setFeedback({
+        type: 'error',
+        message: res.message || 'Erro ao excluir a solicitação.',
+      });
+    }
+  };
+
+  const handleRequestDeleteNegReq = async (reason: string) => {
+    if (!requestToDelete || isDeleting) return;
+    setIsDeleting(true);
+    const target = requestToDelete;
+    const res = await createDeletionRequest({
+      recordType: 'SOLICITACAO_NEGATIVA',
+      targetId: target.id,
+      targetCode: target.productCode,
+      targetName: target.productName,
+      targetDetails: `Solicitação estoque negativo em ${target.date} · Retirada: ${target.withdrawnBy} · Obra: ${target.destination}`,
+      quantity: target.requestedQuantity,
+      reason,
+    });
+    setIsDeleting(false);
+    setRequestToDelete(null);
+
+    setFeedback({
+      type: res.success ? 'success' : 'error',
+      message:
+        res.message ||
+        (res.success
+          ? 'Solicitação de exclusão enviada ao Administrador.'
+          : 'Erro ao solicitar exclusão.'),
+    });
+    setTimeout(() => setFeedback(null), 6000);
+  };
+
+  const activeDeletionTarget: DeletionTarget | null = exitToDelete
+    ? {
+        recordType: 'SAIDA',
+        targetId: exitToDelete.id,
+        targetCode: exitToDelete.productCode,
+        targetName: exitToDelete.productName,
+        targetDetails: `Saída em ${exitToDelete.date} · Obra: ${exitToDelete.destination || '-'}`,
+        quantity: exitToDelete.quantity,
+        modalTitle: 'Confirmar Exclusão de Saída',
+        summaryText: (
+          <>
+            {canDeleteDirectly ? 'Tem certeza que deseja excluir a saída de ' : 'Solicitar exclusão da saída de '}
+            <strong className="text-red-700">-{exitToDelete.quantity} un</strong> do produto{' '}
+            <strong className="text-zinc-900">"{exitToDelete.productName}"</strong>{' '}
+            (<span className="font-mono font-semibold">{exitToDelete.productCode}</span>) registrada em{' '}
+            <span className="font-mono">{exitToDelete.date}</span>?
+          </>
+        ),
+        stockImpactWarning: (
+          <span>
+            Esta ação apagará o registro definitivamente e{' '}
+            <strong>devolverá {exitToDelete.quantity} unidade(s)</strong> ao estoque atual do produto, atualizando relatórios e estatísticas automaticamente.
+          </span>
+        ),
+      }
+    : requestToDelete
+    ? {
+        recordType: 'SOLICITACAO_NEGATIVA',
+        targetId: requestToDelete.id,
+        targetCode: requestToDelete.productCode,
+        targetName: requestToDelete.productName,
+        targetDetails: `Solicitação pendente em ${requestToDelete.date} · Obra: ${requestToDelete.destination}`,
+        quantity: requestToDelete.requestedQuantity,
+        modalTitle: 'Excluir Solicitação Pendente',
+        summaryText: (
+          <>
+            {canDeleteDirectly
+              ? 'Tem certeza que deseja excluir a solicitação de estoque negativo de '
+              : 'Solicitar exclusão da solicitação de estoque negativo de '}
+            <strong className="text-zinc-900">{requestToDelete.requestedQuantity} un</strong> do produto{' '}
+            <strong className="text-zinc-900">"{requestToDelete.productName}"</strong>? Esta ação não altera o estoque físico.
+          </>
+        ),
+      }
+    : null;
+
   return (
     <div className="space-y-6">
       {/* Top Header */}
@@ -197,7 +384,7 @@ export const ExitsTab: React.FC = () => {
             Saídas & Requisições de Materiais
           </h1>
           <p className="text-xs text-zinc-500 mt-1">
-            Controle de retiradas com identificação obrigatória do funcionário, destino e proteção contra estoque negativo.
+            Controle de retiradas com identificação obrigatória do colaborador que retirou, destino e proteção contra estoque negativo.
           </p>
         </div>
 
@@ -268,32 +455,52 @@ export const ExitsTab: React.FC = () => {
                     )}
                   </div>
 
-                  {currentUser.isAdmin ? (
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        onClick={() => {
-                          const res = approveNegativeStockRequest(req.id);
-                          if (res.success) {
-                            setFeedback({ type: 'success', message: res.message || 'Saída autorizada!' });
-                            setTimeout(() => setFeedback(null), 5000);
-                          }
-                        }}
-                        className="px-3.5 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg font-semibold text-xs transition-colors shadow-xs"
-                      >
-                        Autorizar Saída Excepcional
-                      </button>
-                      <button
-                        onClick={() => rejectNegativeStockRequest(req.id)}
-                        className="px-3 py-1.5 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded-lg text-xs font-medium transition-colors"
-                      >
-                        Recusar
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="shrink-0 text-[11px] text-amber-800 font-semibold italic bg-amber-50 px-2 py-1 rounded">
-                      Aguardando parecer do Administrador
-                    </div>
-                  )}
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    {currentUser.isAdmin ? (
+                      <>
+                        <button
+                          onClick={() => {
+                            const res = approveNegativeStockRequest(req.id);
+                            if (res.success) {
+                              setFeedback({ type: 'success', message: res.message || 'Saída autorizada!' });
+                              setTimeout(() => setFeedback(null), 5000);
+                            }
+                          }}
+                          className="px-3.5 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg font-semibold text-xs transition-colors shadow-xs"
+                        >
+                          Autorizar Saída Excepcional
+                        </button>
+                        <button
+                          onClick={() => rejectNegativeStockRequest(req.id)}
+                          className="px-3 py-1.5 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 rounded-lg text-xs font-medium transition-colors"
+                        >
+                          Recusar
+                        </button>
+                      </>
+                    ) : (
+                      <div className="text-[11px] text-amber-800 font-semibold italic bg-amber-50 px-2 py-1 rounded">
+                        Aguardando parecer do Administrador
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setRequestToDelete(req)}
+                      title={
+                        pendingDeletionIds.has(req.id)
+                          ? 'Solicitação de exclusão pendente'
+                          : canDeleteDirectly
+                          ? 'Excluir solicitação'
+                          : 'Solicitar exclusão'
+                      }
+                      className={`p-1.5 rounded-lg transition-colors ${
+                        pendingDeletionIds.has(req.id)
+                          ? 'text-amber-600 bg-amber-50'
+                          : 'text-zinc-400 hover:text-red-600 hover:bg-red-50'
+                      }`}
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
               ))}
           </div>
@@ -301,12 +508,12 @@ export const ExitsTab: React.FC = () => {
       )}
 
       {/* Filter Bar */}
-      <div className="bg-white p-4 rounded-xl border border-zinc-200 shadow-xs flex items-center justify-between gap-4">
-        <div className="relative flex-1 max-w-md">
+      <div className="bg-white p-3.5 sm:p-4 rounded-xl border border-zinc-200 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+        <div className="relative w-full sm:flex-1 sm:max-w-md">
           <Search className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2" />
           <input
             type="text"
-            placeholder="Buscar por produto, código, funcionário que retirou ou obra..."
+            placeholder="Buscar por produto, código, colaborador que retirou ou obra..."
             value={searchFilter}
             onChange={(e) => setSearchFilter(e.target.value)}
             className="w-full pl-9 pr-3 py-2 text-xs border border-zinc-200 rounded-lg focus:outline-none focus:border-red-600 bg-zinc-50/50"
@@ -318,8 +525,81 @@ export const ExitsTab: React.FC = () => {
         </div>
       </div>
 
-      {/* SECTION 6: Tabela Principal de Saídas com Coluna "Funcionário que retirou o material" */}
-      <div className="bg-white border border-zinc-200 rounded-xl overflow-hidden shadow-xs">
+      {/* Mobile Cards (< md) */}
+      <div className="md:hidden space-y-3">
+        {filteredExits.length === 0 ? (
+          <div className="bg-white border border-zinc-200 rounded-xl p-8 text-center text-zinc-400 text-xs">
+            <Layers className="w-8 h-8 mx-auto text-zinc-300 stroke-1 mb-1" />
+            Nenhum registro de saída encontrado.
+          </div>
+        ) : (
+          filteredExits.map((exit) => (
+            <div key={exit.id} className="bg-white border border-zinc-200 rounded-xl p-4 shadow-xs space-y-2.5 text-xs">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="bg-zinc-100 px-2 py-0.5 rounded border border-zinc-200 font-mono font-semibold text-zinc-900">
+                      {exit.productCode}
+                    </span>
+                    <span className="px-2 py-0.5 bg-zinc-100 rounded text-zinc-700 text-[11px]">
+                      {exit.group}
+                    </span>
+                  </div>
+                  <p className="font-semibold text-zinc-900 mt-1">{exit.productName}</p>
+                  {exit.isNegativeStockAuthorized && (
+                    <span className="text-[10px] text-red-600 font-semibold bg-red-50 border border-red-200 px-1.5 py-0.5 rounded inline-block mt-1">
+                      Estoque Negativo Autorizado por {exit.authorizedBy}
+                    </span>
+                  )}
+                </div>
+                <span className="font-mono font-bold text-red-600 tabular-nums shrink-0">
+                  -{exit.quantity} un
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 gap-1 text-[11px] text-zinc-600 bg-zinc-50 p-2.5 rounded-lg border border-zinc-100">
+                <div className="flex items-center gap-1.5 font-semibold text-zinc-900">
+                  <User className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                  <span>Retirou: {exit.withdrawnBy || '-'}</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <HardHat className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                  <span>Obra: {exit.destination || '-'}</span>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] text-zinc-500">
+                <span>{exit.date} · Resp: {exit.responsibleUser}</span>
+                <span className={`px-2 py-0.5 rounded border font-mono font-bold ${exit.stockAfterMovement < 0 ? 'bg-red-100 text-red-800 border-red-300' : 'bg-zinc-100 text-zinc-800 border-zinc-200'}`}>
+                  Saldo: {exit.stockAfterMovement} un
+                </span>
+              </div>
+              <div className="flex justify-end pt-1">
+                <button
+                  type="button"
+                  onClick={() => setExitToDelete(exit)}
+                  className={`flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium border rounded-lg transition-colors ${
+                    pendingDeletionIds.has(exit.id)
+                      ? 'text-amber-700 bg-amber-50 border-amber-200'
+                      : 'text-red-600 hover:bg-red-50 border-red-200'
+                  }`}
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  {pendingDeletionIds.has(exit.id)
+                    ? 'Exclusão solicitada'
+                    : canDeleteDirectly
+                    ? 'Excluir'
+                    : 'Solicitar exclusão'}
+                </button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* SECTION 6: Tabela Principal de Saídas (md+) */}
+      <div className="hidden md:block bg-white border border-zinc-200 rounded-xl overflow-hidden shadow-xs">
+        <div className="overflow-x-auto">
         <table className="w-full text-left text-xs">
           <thead className="bg-zinc-900 text-zinc-200 uppercase tracking-wider text-[11px] font-semibold">
             <tr>
@@ -329,15 +609,16 @@ export const ExitsTab: React.FC = () => {
               <th className="py-3 px-4">Grupo</th>
               <th className="py-3 px-4 text-right">Qtd. Retirada</th>
               <th className="py-3 px-4 text-right">Saldo Restante</th>
-              <th className="py-3 px-4 font-bold text-red-400">Funcionário que Retirou</th>
+              <th className="py-3 px-4 font-bold text-red-400">Colaborador que Retirou</th>
               <th className="py-3 px-4">Obra / Destino</th>
               <th className="py-3 px-4">Responsável Registro</th>
+              <th className="py-3 px-4 text-center">Ações</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-200">
             {filteredExits.length === 0 ? (
               <tr>
-                <td colSpan={9} className="py-10 text-center text-zinc-400">
+                <td colSpan={10} className="py-10 text-center text-zinc-400">
                   <Layers className="w-8 h-8 mx-auto text-zinc-300 stroke-1 mb-1" />
                   Nenhum registro de saída encontrado.
                 </td>
@@ -393,18 +674,39 @@ export const ExitsTab: React.FC = () => {
                   <td className="py-3 px-4 text-zinc-500 whitespace-nowrap text-[11px]">
                     {exit.responsibleUser}
                   </td>
+                  <td className="py-3 px-4 text-center whitespace-nowrap">
+                    <button
+                      type="button"
+                      onClick={() => setExitToDelete(exit)}
+                      title={
+                        pendingDeletionIds.has(exit.id)
+                          ? 'Solicitação de exclusão pendente'
+                          : canDeleteDirectly
+                          ? 'Excluir registro de saída'
+                          : 'Solicitar exclusão'
+                      }
+                      className={`p-1.5 rounded-lg transition-colors ${
+                        pendingDeletionIds.has(exit.id)
+                          ? 'text-amber-600 bg-amber-50'
+                          : 'text-zinc-400 hover:text-red-600 hover:bg-red-50'
+                      }`}
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </td>
                 </tr>
               ))
             )}
           </tbody>
         </table>
+        </div>
       </div>
 
       {/* SECTION 6: Modal Nova Saída (Sem campo de requisição, sem quantidade ao lado do nome) */}
       {isModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
-          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full overflow-hidden border border-zinc-200">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-100 bg-zinc-900 text-white">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/70 backdrop-blur-xs">
+          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto border border-zinc-200">
+            <div className="flex items-center justify-between px-5 sm:px-6 py-4 border-b border-zinc-100 bg-zinc-900 text-white sticky top-0 z-10">
               <h3 className="text-sm font-bold flex items-center gap-2">
                 <ArrowUpRight className="w-4 h-4 text-red-400" />
                 Registrar Saída de Material
@@ -418,6 +720,11 @@ export const ExitsTab: React.FC = () => {
             </div>
 
             <form onSubmit={handleSubmit} className="p-6 space-y-4">
+              {formError && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800 font-medium">
+                  {formError}
+                </div>
+              )}
               {/* 1. Data e Horário */}
               <div>
                 <label className="block text-xs font-semibold text-zinc-700 mb-1">
@@ -505,27 +812,62 @@ export const ExitsTab: React.FC = () => {
                 )}
               </div>
 
-              {/* 3. CAMPO OBRIGATÓRIO: FUNCIONÁRIO QUE RETIROU O MATERIAL */}
+              {/* 3. CAMPO OBRIGATÓRIO: COLABORADOR QUE RETIROU */}
               <div>
                 <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                  FUNCIONÁRIO QUE RETIROU O MATERIAL *
+                  Colaborador que retirou *
                 </label>
-                <select
-                  required
-                  value={formData.withdrawnBy}
-                  onChange={(e) => setFormData({ ...formData, withdrawnBy: e.target.value })}
-                  className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white font-medium"
-                >
-                  <option value="">Selecione o colaborador responsável pela retirada...</option>
-                  {activeEmployees.map((emp) => (
-                    <option key={emp.id} value={emp.name}>
-                      {emp.name} ({emp.role} - {emp.department})
-                    </option>
-                  ))}
-                </select>
-                <span className="text-[10px] text-zinc-400 mt-0.5 block">
-                  Colaborador cadastrado na área administrativa responsável pelo material.
-                </span>
+                {activeCollaborators.length === 0 ? (
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 space-y-2">
+                    <p className="font-medium">
+                      Nenhum colaborador ativo cadastrado. Cadastre os funcionários antes de registrar uma saída.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsModalOpen(false);
+                          setActiveTab('colaboradores');
+                        }}
+                        className="px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-md font-semibold text-[11px]"
+                      >
+                        Ir para Colaboradores
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsModalOpen(false);
+                          setActiveTab('configuracoes');
+                        }}
+                        className="px-3 py-1.5 bg-white border border-amber-300 hover:bg-amber-100 text-amber-900 rounded-md font-semibold text-[11px]"
+                      >
+                        Cadastrar em Configurações
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <select
+                      required
+                      value={formData.collaboratorId}
+                      onChange={(e) =>
+                        setFormData({ ...formData, collaboratorId: e.target.value })
+                      }
+                      className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white font-medium"
+                    >
+                      <option value="">Selecione o colaborador que retirou...</option>
+                      {activeCollaborators.map((colab) => (
+                        <option key={colab.id} value={colab.id}>
+                          {colab.fullName}
+                          {colab.role ? ` (${colab.role})` : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="text-[10px] text-zinc-400 mt-0.5 block">
+                      Funcionários ativos cadastrados (sem acesso ao aplicativo).
+                    </span>
+                  </>
+                )}
               </div>
 
               {/* 4. Obra de Destino / Frente de Serviço */}
@@ -539,6 +881,11 @@ export const ExitsTab: React.FC = () => {
                   onChange={(e) => setFormData({ ...formData, destination: e.target.value })}
                   className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white"
                 >
+                  <option value="">
+                    {managedLists.destinations.length === 0
+                      ? 'Cadastre uma obra em Configurações...'
+                      : 'Selecione a obra / destino...'}
+                  </option>
                   {managedLists.destinations.map((dest) => (
                     <option key={dest} value={dest}>
                       {dest}
@@ -553,21 +900,22 @@ export const ExitsTab: React.FC = () => {
                   Quantidade a Retirar (Unidades) *
                 </label>
                 <input
-                  type="number"
-                  min="1"
+                  type="text"
+                  inputMode="numeric"
                   required
                   value={formData.quantity}
                   onChange={(e) =>
-                    setFormData({ ...formData, quantity: Number(e.target.value) })
+                    setFormData({ ...formData, quantity: e.target.value.replace(/\D/g, '') })
                   }
+                  placeholder="Ex: 5"
                   className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg font-mono tabular-nums font-bold text-red-700 focus:outline-none focus:border-red-600"
                 />
               </div>
 
-              {/* Informação da Quantidade Disponível na Parte Inferior do Formulário (conforme solicitado) */}
+              {/* Informação da Quantidade Disponível na Parte Inferior do Formulário */}
               {selectedProduct && (
-                <div className={`p-3 rounded-lg border text-xs flex items-center justify-between ${
-                  selectedProduct.currentStock < formData.quantity
+                <div className={`p-3 rounded-lg border text-xs flex items-center justify-between gap-3 ${
+                  parsedQuantity > 0 && selectedProduct.currentStock < parsedQuantity
                     ? 'bg-red-50 border-red-300 text-red-900'
                     : 'bg-zinc-50 border-zinc-200 text-zinc-700'
                 }`}>
@@ -577,11 +925,11 @@ export const ExitsTab: React.FC = () => {
                       Produto: {selectedProduct.name}
                     </span>
                   </div>
-                  <div className="text-right">
+                  <div className="text-right shrink-0">
                     <span className="font-mono font-bold text-sm tabular-nums">
                       {selectedProduct.currentStock} un
                     </span>
-                    {selectedProduct.currentStock < formData.quantity && (
+                    {parsedQuantity > 0 && selectedProduct.currentStock < parsedQuantity && (
                       <span className="block text-[10px] text-red-600 font-semibold">
                         Aviso: Quantidade solicitada excede o saldo!
                       </span>
@@ -616,7 +964,7 @@ export const ExitsTab: React.FC = () => {
                   type="submit"
                   className="px-5 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg shadow-xs"
                 >
-                  {selectedProduct && selectedProduct.currentStock < formData.quantity
+                  {selectedProduct && parsedQuantity > 0 && selectedProduct.currentStock < parsedQuantity
                     ? 'Solicitar Autorização ao Administrador'
                     : 'Confirmar Saída'}
                 </button>
@@ -628,9 +976,9 @@ export const ExitsTab: React.FC = () => {
 
       {/* SECTION 7: Modal de Solicitação de Autorização ao Administrador para Estoque Negativo */}
       {isSolicitationModalOpen && selectedProduct && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-xs">
-          <div className="bg-white rounded-xl shadow-2xl max-w-md w-full overflow-hidden border border-zinc-200">
-            <div className="flex items-center justify-between px-5 py-3.5 bg-red-600 text-white">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/75 backdrop-blur-xs">
+          <div className="bg-white rounded-xl shadow-2xl max-w-md w-full max-h-[90vh] overflow-y-auto border border-zinc-200">
+            <div className="flex items-center justify-between px-5 py-3.5 bg-red-600 text-white sticky top-0 z-10">
               <div className="flex items-center gap-2">
                 <ShieldAlert className="w-5 h-5 text-white" />
                 <h3 className="text-sm font-bold">
@@ -649,8 +997,8 @@ export const ExitsTab: React.FC = () => {
               <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-red-900 space-y-1">
                 <p className="font-bold">A saída solicitada excede o saldo físico:</p>
                 <p>Estoque disponível: <strong>{selectedProduct.currentStock} un</strong></p>
-                <p>Quantidade desejada: <strong>{formData.quantity} un</strong></p>
-                <p>Déficit resultante: <strong className="text-red-700">{formData.quantity - selectedProduct.currentStock} un</strong></p>
+                <p>Quantidade desejada: <strong>{parsedQuantity} un</strong></p>
+                <p>Déficit resultante: <strong className="text-red-700">{parsedQuantity - selectedProduct.currentStock} un</strong></p>
               </div>
 
               <p className="text-zinc-600 leading-relaxed">
@@ -691,6 +1039,25 @@ export const ExitsTab: React.FC = () => {
           </div>
         </div>
       )}
+
+      <DeletionActionModal
+        target={activeDeletionTarget}
+        canDeleteDirectly={canDeleteDirectly}
+        hasPendingRequest={
+          activeDeletionTarget ? pendingDeletionIds.has(activeDeletionTarget.targetId) : false
+        }
+        isSubmitting={isDeleting}
+        onClose={() => {
+          setExitToDelete(null);
+          setRequestToDelete(null);
+        }}
+        onConfirmDirectDelete={
+          exitToDelete ? handleConfirmDeleteExit : handleConfirmDeleteRequest
+        }
+        onSubmitRequest={
+          exitToDelete ? handleRequestDeleteExit : handleRequestDeleteNegReq
+        }
+      />
     </div>
   );
 };

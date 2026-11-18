@@ -1,0 +1,686 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // GLOBAL HARDENED PRIMITIVES
+    // =========================================================================
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidEmailId(emailKey) {
+      return emailKey is string
+        && emailKey.size() >= 5
+        && emailKey.size() <= 200
+        && emailKey.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser()
+        && request.auth.token.email is string
+        && request.auth.token.email.lower() == 'welisson.oliveira08@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin()
+        || (isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function isAuthorizedEmployee() {
+      return isAdmin()
+        || (
+          isVerifiedUser()
+          && request.auth.token.email is string
+          && exists(/databases/$(database)/documents/authorizedEmails/$(request.auth.token.email.lower()))
+          && get(/databases/$(database)/documents/authorizedEmails/$(request.auth.token.email.lower())).data.active == true
+        );
+    }
+
+    function hasDeletePermission() {
+      return isAdmin()
+        || (
+          isAuthorizedEmployee()
+          && 'canDelete' in get(/databases/$(database)/documents/authorizedEmails/$(request.auth.token.email.lower())).data
+          && get(/databases/$(database)/documents/authorizedEmails/$(request.auth.token.email.lower())).data.canDelete == true
+        );
+    }
+
+    // =========================================================================
+    // ENTITY VALIDATION BLUEPRINTS (Anti-Update-Gap)
+    // =========================================================================
+
+    function isValidAdmin(data) {
+      return data.keys().hasAll(['uid', 'email', 'name', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'email', 'name', 'createdAt'])
+        && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 5 && data.email.size() <= 200
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAuthorizedEmail(data) {
+      return data.keys().hasAll(['active', 'isAdmin', 'userDocId', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['active', 'isAdmin', 'canDelete', 'userDocId', 'createdAt', 'updatedAt'])
+        && data.active is bool
+        && data.isAdmin is bool
+        && (!('canDelete' in data) || data.canDelete is bool)
+        && isValidId(data.userDocId)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSettings(data) {
+      return data.keys().hasAll([
+          'showProductPhotos', 'companyName', 'companySubtitle',
+          'cnpj', 'contactEmail', 'lowStockAlertNotification', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'showProductPhotos', 'companyName', 'companySubtitle',
+          'cnpj', 'contactEmail', 'lowStockAlertNotification', 'createdAt', 'updatedAt'
+        ])
+        && data.showProductPhotos is bool
+        && data.companyName is string && data.companyName.size() >= 1 && data.companyName.size() <= 120
+        && data.companySubtitle is string && data.companySubtitle.size() <= 200
+        && data.cnpj is string && data.cnpj.size() <= 30
+        && data.contactEmail is string && data.contactEmail.size() <= 150
+        && data.lowStockAlertNotification is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStringList(arr, maxLen) {
+      return arr is list
+        && arr.size() <= maxLen
+        && (arr.size() == 0 || (arr[0] is string && arr[0].size() >= 1 && arr[0].size() <= 120));
+    }
+
+    function isValidManagedLists(data) {
+      return data.keys().hasAll(['groups', 'roles', 'destinations', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['groups', 'roles', 'destinations', 'createdAt', 'updatedAt'])
+        && isValidStringList(data.groups, 100)
+        && isValidStringList(data.roles, 100)
+        && isValidStringList(data.destinations, 150)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPermissions(perms) {
+      return perms is map
+        && perms.keys().hasAll([
+          'dashboard', 'produtos', 'entradas', 'saidas', 'relatorios', 'estatisticas', 'configuracoes'
+        ])
+        && perms.keys().hasOnly([
+          'dashboard', 'produtos', 'entradas', 'saidas', 'relatorios', 'estatisticas', 'configuracoes', 'colaboradores'
+        ])
+        && perms.dashboard is bool
+        && perms.produtos is bool
+        && perms.entradas is bool
+        && perms.saidas is bool
+        && perms.relatorios is bool
+        && perms.estatisticas is bool
+        && perms.configuracoes is bool
+        && (!('colaboradores' in perms) || perms.colaboradores is bool);
+    }
+
+    function isValidUserAccount(data) {
+      return data.keys().hasAll([
+          'id', 'name', 'email', 'role', 'department', 'isAdmin',
+          'active', 'permissions', 'registrationDate', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'name', 'email', 'role', 'department', 'isAdmin', 'canDelete',
+          'active', 'permissions', 'registrationDate', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
+        && data.email is string && data.email.size() >= 5 && data.email.size() <= 200
+        && data.role is string && data.role.size() >= 1 && data.role.size() <= 100
+        && data.department is string && data.department.size() <= 100
+        && data.isAdmin is bool
+        && (!('canDelete' in data) || data.canDelete is bool)
+        && data.active is bool
+        && isValidPermissions(data.permissions)
+        && data.registrationDate is string && data.registrationDate.size() <= 30
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStaffMember(data) {
+      return data.keys().hasAll([
+          'id', 'orgId', 'name', 'role', 'department', 'active', 'isAdmin', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'orgId', 'name', 'role', 'department', 'active', 'isAdmin', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.orgId == 'qhs-engenharia'
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 120
+        && data.role is string && data.role.size() >= 1 && data.role.size() <= 100
+        && data.department is string && data.department.size() <= 100
+        && data.active is bool
+        && data.isAdmin is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCollaborator(data) {
+      return data.keys().hasAll([
+          'id', 'orgId', 'fullName', 'active', 'registrationDate',
+          'displayUpdatedAt', 'ownerUid', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'orgId', 'fullName', 'role', 'active', 'registrationDate',
+          'displayUpdatedAt', 'ownerUid', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.orgId == 'qhs-engenharia'
+        && data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 120
+        && (!('role' in data) || (data.role is string && data.role.size() <= 100))
+        && data.active is bool
+        && data.registrationDate is string && data.registrationDate.size() <= 30
+        && data.displayUpdatedAt is string && data.displayUpdatedAt.size() <= 30
+        && isValidId(data.ownerUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidProduct(data) {
+      return data.keys().hasAll([
+          'id', 'orgId', 'code', 'name', 'group', 'currentStock', 'minStock',
+          'registrationDate', 'displayUpdatedAt', 'ownerUid', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'orgId', 'code', 'name', 'group', 'currentStock', 'minStock', 'unitPrice',
+          'photoUrl', 'description', 'registrationDate', 'displayUpdatedAt', 'ownerUid', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.orgId == 'qhs-engenharia'
+        && data.code is string && data.code.size() >= 1 && data.code.size() <= 60
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 200
+        && data.group is string && data.group.size() >= 2 && data.group.size() <= 80
+        && (data.currentStock is int || data.currentStock is float)
+        && (data.minStock is int || data.minStock is float) && data.minStock >= 0
+        && (!('unitPrice' in data) || ((data.unitPrice is int || data.unitPrice is float) && data.unitPrice >= 0))
+        && (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 300000))
+        && (!('description' in data) || (data.description is string && data.description.size() <= 1000))
+        && data.registrationDate is string && data.registrationDate.size() <= 30
+        && data.displayUpdatedAt is string && data.displayUpdatedAt.size() <= 30
+        && isValidId(data.ownerUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMovement(data) {
+      return data.keys().hasAll([
+          'id', 'orgId', 'productId', 'productCode', 'productName', 'group', 'type',
+          'quantity', 'stockAfterMovement', 'date', 'responsibleUser', 'ownerUid', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'orgId', 'productId', 'productCode', 'productName', 'group', 'type',
+          'quantity', 'unitPrice', 'totalValue', 'stockAfterMovement', 'date', 'withdrawnBy', 'collaboratorId',
+          'responsibleUser', 'destination', 'notes', 'isNegativeStockAuthorized', 'authorizedBy', 'ownerUid', 'createdAt'
+        ])
+        && isValidId(data.id)
+        && data.orgId == 'qhs-engenharia'
+        && isValidId(data.productId)
+        && data.productCode is string && data.productCode.size() >= 1 && data.productCode.size() <= 60
+        && data.productName is string && data.productName.size() >= 2 && data.productName.size() <= 200
+        && data.group is string && data.group.size() >= 2 && data.group.size() <= 80
+        && (data.type == 'ENTRADA' || data.type == 'SAIDA')
+        && (data.quantity is int || data.quantity is float) && data.quantity > 0
+        && (!('unitPrice' in data) || ((data.unitPrice is int || data.unitPrice is float) && data.unitPrice >= 0))
+        && (!('totalValue' in data) || ((data.totalValue is int || data.totalValue is float) && data.totalValue >= 0))
+        && (data.stockAfterMovement is int || data.stockAfterMovement is float)
+        && data.date is string && data.date.size() >= 4 && data.date.size() <= 30
+        && (!('withdrawnBy' in data) || (data.withdrawnBy is string && data.withdrawnBy.size() <= 120))
+        && (!('collaboratorId' in data) || isValidId(data.collaboratorId))
+        && data.responsibleUser is string && data.responsibleUser.size() >= 1 && data.responsibleUser.size() <= 120
+        && (!('destination' in data) || (data.destination is string && data.destination.size() <= 150))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000))
+        && (!('isNegativeStockAuthorized' in data) || data.isNegativeStockAuthorized is bool)
+        && (!('authorizedBy' in data) || (data.authorizedBy is string && data.authorizedBy.size() <= 120))
+        && isValidId(data.ownerUid)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidNegativeRequest(data) {
+      return data.keys().hasAll([
+          'id', 'orgId', 'productId', 'productCode', 'productName', 'group',
+          'requestedQuantity', 'availableStock', 'deficitQuantity', 'withdrawnBy',
+          'destination', 'requestedBy', 'requestedByUid', 'reason', 'date', 'status',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'orgId', 'productId', 'productCode', 'productName', 'group',
+          'requestedQuantity', 'availableStock', 'deficitQuantity', 'withdrawnBy', 'collaboratorId',
+          'destination', 'requestedBy', 'requestedByUid', 'reason', 'date', 'status',
+          'reviewedBy', 'reviewedAt', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.orgId == 'qhs-engenharia'
+        && isValidId(data.productId)
+        && data.productCode is string && data.productCode.size() >= 1 && data.productCode.size() <= 60
+        && data.productName is string && data.productName.size() >= 2 && data.productName.size() <= 200
+        && data.group is string && data.group.size() >= 2 && data.group.size() <= 80
+        && (data.requestedQuantity is int || data.requestedQuantity is float) && data.requestedQuantity > 0
+        && (data.availableStock is int || data.availableStock is float)
+        && (data.deficitQuantity is int || data.deficitQuantity is float) && data.deficitQuantity > 0
+        && data.withdrawnBy is string && data.withdrawnBy.size() >= 1 && data.withdrawnBy.size() <= 120
+        && (!('collaboratorId' in data) || isValidId(data.collaboratorId))
+        && data.destination is string && data.destination.size() >= 1 && data.destination.size() <= 150
+        && data.requestedBy is string && data.requestedBy.size() >= 1 && data.requestedBy.size() <= 120
+        && isValidId(data.requestedByUid)
+        && data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 1000
+        && data.date is string && data.date.size() >= 4 && data.date.size() <= 30
+        && (data.status == 'PENDENTE' || data.status == 'APROVADO' || data.status == 'RECUSADO')
+        && (!('reviewedBy' in data) || (data.reviewedBy is string && data.reviewedBy.size() <= 120))
+        && (!('reviewedAt' in data) || (data.reviewedAt is string && data.reviewedAt.size() <= 30))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDeletionRequest(data) {
+      return data.keys().hasAll([
+          'id', 'orgId', 'recordType', 'targetId', 'targetCode', 'targetName',
+          'targetDetails', 'quantity', 'reason', 'requestedBy', 'requestedByEmail',
+          'requestedByUid', 'date', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'orgId', 'recordType', 'targetId', 'targetCode', 'targetName',
+          'targetDetails', 'quantity', 'reason', 'requestedBy', 'requestedByEmail',
+          'requestedByUid', 'date', 'status', 'reviewedBy', 'reviewedByEmail',
+          'reviewedAt', 'executedBy', 'executedAt', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.orgId == 'qhs-engenharia'
+        && (
+          data.recordType == 'PRODUTO'
+          || data.recordType == 'ENTRADA'
+          || data.recordType == 'SAIDA'
+          || data.recordType == 'SOLICITACAO_NEGATIVA'
+          || data.recordType == 'COLABORADOR'
+        )
+        && isValidId(data.targetId)
+        && data.targetCode is string && data.targetCode.size() <= 60
+        && data.targetName is string && data.targetName.size() >= 1 && data.targetName.size() <= 200
+        && data.targetDetails is string && data.targetDetails.size() <= 400
+        && (data.quantity is int || data.quantity is float)
+        && data.reason is string && data.reason.size() >= 3 && data.reason.size() <= 1000
+        && data.requestedBy is string && data.requestedBy.size() >= 1 && data.requestedBy.size() <= 120
+        && data.requestedByEmail is string && data.requestedByEmail.size() >= 5 && data.requestedByEmail.size() <= 200
+        && isValidId(data.requestedByUid)
+        && data.date is string && data.date.size() >= 4 && data.date.size() <= 30
+        && (data.status == 'PENDENTE' || data.status == 'APROVADO' || data.status == 'RECUSADO')
+        && (!('reviewedBy' in data) || (data.reviewedBy is string && data.reviewedBy.size() <= 120))
+        && (!('reviewedByEmail' in data) || (data.reviewedByEmail is string && data.reviewedByEmail.size() <= 200))
+        && (!('reviewedAt' in data) || (data.reviewedAt is string && data.reviewedAt.size() <= 30))
+        && (!('executedBy' in data) || (data.executedBy is string && data.executedBy.size() <= 120))
+        && (!('executedAt' in data) || (data.executedAt is string && data.executedAt.size() <= 30))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDeletionLog(data) {
+      return data.keys().hasAll([
+          'id', 'orgId', 'origin', 'recordType', 'targetId', 'targetCode',
+          'targetName', 'targetDetails', 'quantity', 'reason', 'requestedBy',
+          'requestedByDate', 'deletedBy', 'deletedByEmail', 'deletedByUid',
+          'deletedAt', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'orgId', 'origin', 'requestId', 'recordType', 'targetId', 'targetCode',
+          'targetName', 'targetDetails', 'quantity', 'reason', 'requestedBy',
+          'requestedByDate', 'approvedBy', 'approvedAt', 'deletedBy', 'deletedByEmail',
+          'deletedByUid', 'deletedAt', 'createdAt'
+        ])
+        && isValidId(data.id)
+        && data.orgId == 'qhs-engenharia'
+        && (data.origin == 'DIRETA' || data.origin == 'APROVADA')
+        && (!('requestId' in data) || isValidId(data.requestId))
+        && (
+          data.recordType == 'PRODUTO'
+          || data.recordType == 'ENTRADA'
+          || data.recordType == 'SAIDA'
+          || data.recordType == 'SOLICITACAO_NEGATIVA'
+          || data.recordType == 'COLABORADOR'
+        )
+        && isValidId(data.targetId)
+        && data.targetCode is string && data.targetCode.size() <= 60
+        && data.targetName is string && data.targetName.size() >= 1 && data.targetName.size() <= 200
+        && data.targetDetails is string && data.targetDetails.size() <= 400
+        && (data.quantity is int || data.quantity is float)
+        && data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 1000
+        && data.requestedBy is string && data.requestedBy.size() >= 1 && data.requestedBy.size() <= 120
+        && data.requestedByDate is string && data.requestedByDate.size() >= 4 && data.requestedByDate.size() <= 30
+        && (!('approvedBy' in data) || (data.approvedBy is string && data.approvedBy.size() <= 120))
+        && (!('approvedAt' in data) || (data.approvedAt is string && data.approvedAt.size() <= 30))
+        && data.deletedBy is string && data.deletedBy.size() >= 1 && data.deletedBy.size() <= 120
+        && data.deletedByEmail is string && data.deletedByEmail.size() >= 5 && data.deletedByEmail.size() <= 200
+        && isValidId(data.deletedByUid)
+        && data.deletedAt is string && data.deletedAt.size() >= 4 && data.deletedAt.size() <= 30
+        && data.createdAt is timestamp;
+    }
+
+    // =========================================================================
+    // COLLECTION MATCH BLOCKS
+    // =========================================================================
+
+    match /admins/{adminId} {
+      allow get: if isVerifiedUser() && isValidId(adminId) && (isAdmin() || request.auth.uid == adminId);
+      allow list: if false;
+      allow create: if isVerifiedUser()
+        && isValidId(adminId)
+        && isValidAdmin(incoming())
+        && isBootstrappedAdmin()
+        && adminId == request.auth.uid
+        && incoming().uid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update: if isBootstrappedAdmin()
+        && isValidId(adminId)
+        && isValidAdmin(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'name']);
+      allow delete: if isBootstrappedAdmin() && isValidId(adminId);
+    }
+
+    match /authorizedEmails/{emailKey} {
+      allow get: if isVerifiedUser()
+        && isValidEmailId(emailKey)
+        && (isAdmin() || request.auth.token.email.lower() == emailKey);
+      allow list: if false;
+      allow create: if isAdmin()
+        && isValidEmailId(emailKey)
+        && isValidAuthorizedEmail(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin()
+        && isValidEmailId(emailKey)
+        && isValidAuthorizedEmail(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['active', 'isAdmin', 'canDelete', 'userDocId', 'updatedAt']);
+      allow delete: if isAdmin() && isValidEmailId(emailKey);
+    }
+
+    match /settings/{settingId} {
+      allow get: if isVerifiedUser() && isValidId(settingId) && isAuthorizedEmployee();
+      allow list: if false;
+      allow create: if isAdmin()
+        && isValidId(settingId)
+        && isValidSettings(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(settingId)
+        && isValidSettings(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (isAuthorizedEmployee() && incoming().diff(existing()).affectedKeys().hasOnly(['showProductPhotos', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    match /managedLists/{listId} {
+      allow get: if isVerifiedUser() && isValidId(listId) && isAuthorizedEmployee();
+      allow list: if false;
+      allow create: if isAdmin()
+        && isValidId(listId)
+        && isValidManagedLists(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin()
+        && isValidId(listId)
+        && isValidManagedLists(incoming())
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['groups', 'roles', 'destinations', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    match /users/{userId} {
+      allow get: if isVerifiedUser()
+        && isValidId(userId)
+        && (isAdmin() || existing().email.lower() == request.auth.token.email.lower());
+      allow list: if isVerifiedUser()
+        && (
+          isBootstrappedAdmin()
+          || (request.auth.token.email is string && resource.data.email == request.auth.token.email.lower())
+        );
+      allow create: if isAdmin()
+        && isValidId(userId)
+        && isValidUserAccount(incoming())
+        && incoming().id == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin()
+        && isValidId(userId)
+        && isValidUserAccount(incoming())
+        && incoming().id == existing().id
+        && incoming().registrationDate == existing().registrationDate
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'email', 'role', 'department', 'isAdmin', 'canDelete', 'active', 'permissions', 'updatedAt'
+        ]);
+      allow delete: if isAdmin() && isValidId(userId) && userId != 'user-owner';
+    }
+
+    match /staffDirectory/{staffId} {
+      allow get: if isVerifiedUser() && isValidId(staffId) && isAuthorizedEmployee();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'qhs-engenharia';
+      allow create: if isAdmin()
+        && isValidId(staffId)
+        && isValidStaffMember(incoming())
+        && incoming().id == staffId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin()
+        && isValidId(staffId)
+        && isValidStaffMember(incoming())
+        && incoming().id == existing().id
+        && incoming().orgId == existing().orgId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'role', 'department', 'active', 'isAdmin', 'updatedAt'
+        ]);
+      allow delete: if isAdmin() && isValidId(staffId) && staffId != 'user-owner';
+    }
+
+    match /collaborators/{collaboratorId} {
+      allow get: if isVerifiedUser() && isValidId(collaboratorId) && isAuthorizedEmployee();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'qhs-engenharia';
+      allow create: if isVerifiedUser()
+        && isValidId(collaboratorId)
+        && isValidCollaborator(incoming())
+        && isAuthorizedEmployee()
+        && incoming().id == collaboratorId
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(collaboratorId)
+        && isValidCollaborator(incoming())
+        && isAuthorizedEmployee()
+        && incoming().id == existing().id
+        && incoming().orgId == existing().orgId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().registrationDate == existing().registrationDate
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'fullName', 'role', 'active', 'displayUpdatedAt', 'updatedAt'
+        ]);
+      allow delete: if isVerifiedUser() && isValidId(collaboratorId) && hasDeletePermission();
+    }
+
+    match /products/{productId} {
+      allow get: if isVerifiedUser() && isValidId(productId) && isAuthorizedEmployee();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'qhs-engenharia';
+      allow create: if isVerifiedUser()
+        && isValidId(productId)
+        && isValidProduct(incoming())
+        && isAuthorizedEmployee()
+        && incoming().id == productId
+        && incoming().ownerUid == request.auth.uid
+        && incoming().currentStock >= 0
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(productId)
+        && isValidProduct(incoming())
+        && isAuthorizedEmployee()
+        && incoming().id == existing().id
+        && incoming().orgId == existing().orgId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().registrationDate == existing().registrationDate
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            (incoming().currentStock >= 0 || incoming().currentStock > existing().currentStock)
+            && (
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'code', 'name', 'group', 'currentStock', 'minStock', 'unitPrice', 'photoUrl', 'description', 'displayUpdatedAt', 'updatedAt'
+              ])
+              || incoming().diff(existing()).affectedKeys().hasOnly([
+                'currentStock', 'displayUpdatedAt', 'updatedAt'
+              ])
+            )
+          )
+        );
+      allow delete: if isVerifiedUser() && isValidId(productId) && hasDeletePermission();
+    }
+
+    match /movements/{movementId} {
+      allow get: if isVerifiedUser() && isValidId(movementId) && isAuthorizedEmployee();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'qhs-engenharia';
+      allow create: if isVerifiedUser()
+        && isValidId(movementId)
+        && isValidMovement(incoming())
+        && isAuthorizedEmployee()
+        && incoming().id == movementId
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/products/$(incoming().productId))
+        && (
+          isAdmin()
+          || (
+            (!('isNegativeStockAuthorized' in incoming()) || incoming().isNegativeStockAuthorized == false)
+            && incoming().stockAfterMovement >= 0
+          )
+        );
+      allow update: if isAdmin()
+        && isValidId(movementId)
+        && isValidMovement(incoming())
+        && incoming().id == existing().id
+        && incoming().orgId == existing().orgId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['group']);
+      allow delete: if isVerifiedUser() && isValidId(movementId) && hasDeletePermission();
+    }
+
+    match /negativeRequests/{requestId} {
+      allow get: if isVerifiedUser() && isValidId(requestId) && isAuthorizedEmployee();
+      allow list: if isVerifiedUser() && resource.data.orgId == 'qhs-engenharia';
+      allow create: if isVerifiedUser()
+        && isValidId(requestId)
+        && isValidNegativeRequest(incoming())
+        && isAuthorizedEmployee()
+        && incoming().id == requestId
+        && incoming().requestedByUid == request.auth.uid
+        && incoming().status == 'PENDENTE'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/products/$(incoming().productId));
+      allow update: if isAdmin()
+        && isValidId(requestId)
+        && isValidNegativeRequest(incoming())
+        && existing().status == 'PENDENTE'
+        && incoming().id == existing().id
+        && incoming().orgId == existing().orgId
+        && incoming().requestedByUid == existing().requestedByUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'reviewedBy', 'reviewedAt', 'updatedAt'
+        ]);
+      allow delete: if isVerifiedUser() && isValidId(requestId) && hasDeletePermission();
+    }
+
+    match /deletionRequests/{requestId} {
+      allow get: if isVerifiedUser()
+        && isValidId(requestId)
+        && (isAdmin() || (isAuthorizedEmployee() && existing().requestedByUid == request.auth.uid));
+      allow list: if isVerifiedUser()
+        && (
+          isBootstrappedAdmin()
+          || resource.data.requestedByUid == request.auth.uid
+        );
+      allow create: if isVerifiedUser()
+        && isValidId(requestId)
+        && isValidDeletionRequest(incoming())
+        && isAuthorizedEmployee()
+        && incoming().id == requestId
+        && incoming().requestedByUid == request.auth.uid
+        && incoming().status == 'PENDENTE'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin()
+        && isValidId(requestId)
+        && isValidDeletionRequest(incoming())
+        && existing().status == 'PENDENTE'
+        && incoming().id == existing().id
+        && incoming().orgId == existing().orgId
+        && incoming().requestedByUid == existing().requestedByUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'reviewedBy', 'reviewedByEmail', 'reviewedAt', 'executedBy', 'executedAt', 'updatedAt'
+        ]);
+      allow delete: if isAdmin() && isValidId(requestId);
+    }
+
+    match /deletionLogs/{logId} {
+      allow get: if isAdmin() && isValidId(logId);
+      allow list: if isBootstrappedAdmin();
+      allow create: if isVerifiedUser()
+        && isValidId(logId)
+        && isValidDeletionLog(incoming())
+        && hasDeletePermission()
+        && incoming().id == logId
+        && incoming().deletedByUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isAdmin() && isValidId(logId);
+    }
+  }
+}

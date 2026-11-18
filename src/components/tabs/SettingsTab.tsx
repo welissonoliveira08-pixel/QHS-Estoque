@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
-import { useApp } from '../../context/AppContext';
-import { TabId, User, UserPermissions } from '../../types';
+import React, { useEffect, useMemo, useState } from 'react';
+import { SettingsSubTab, useApp } from '../../context/AppContext';
+import { DeletionRecordType, TabId, User, UserPermissions } from '../../types';
+import { DeletionActionModal, DeletionTarget } from '../DeletionActionModal';
 import {
   Settings,
   Shield,
@@ -22,6 +23,12 @@ import {
   HardHat,
   Briefcase,
   Layers,
+  History,
+  Lock,
+  ShieldCheck,
+  Users,
+  Copy,
+  Mail,
 } from 'lucide-react';
 
 const TAB_CONFIGS: { id: TabId; label: string; desc: string }[] = [
@@ -29,21 +36,46 @@ const TAB_CONFIGS: { id: TabId; label: string; desc: string }[] = [
   { id: 'produtos', label: 'Cadastro de Produtos', desc: 'Visualizar e cadastrar produtos' },
   { id: 'entradas', label: 'Entradas', desc: 'Recebimento de materiais' },
   { id: 'saidas', label: 'Saídas', desc: 'Requisições para canteiros de obras' },
+  { id: 'colaboradores', label: 'Colaboradores', desc: 'Cadastro de funcionários de obra (sem login)' },
   { id: 'relatorios', label: 'Relatórios', desc: 'Emissão e exportação de relatórios' },
   { id: 'estatisticas', label: 'Estatísticas', desc: 'Giro de estoque e métricas' },
   { id: 'configuracoes', label: 'Configurações', desc: 'Gerenciamento de listas e permissões' },
 ];
 
+const getRecordTypeLabel = (type: DeletionRecordType) => {
+  switch (type) {
+    case 'PRODUTO':
+      return 'Produto';
+    case 'ENTRADA':
+      return 'Entrada';
+    case 'SAIDA':
+      return 'Saída';
+    case 'SOLICITACAO_NEGATIVA':
+      return 'Solic. Estoque Negativo';
+    case 'COLABORADOR':
+      return 'Colaborador';
+  }
+};
+
 export const SettingsTab: React.FC = () => {
   const {
+    isRealAdmin,
     settings,
     updateSettings,
     users,
     updateUserPermissions,
+    updateUserDeletePermission,
     updateUser,
     addUser,
     deleteUser,
+    collaborators,
+    addCollaborator,
+    updateCollaborator,
+    toggleCollaboratorActive,
+    deleteCollaborator,
+    setActiveTab,
     currentUser,
+    canDeleteDirectly,
     resetAllData,
     managedLists,
     addGroup,
@@ -58,11 +90,53 @@ export const SettingsTab: React.FC = () => {
     negativeRequests,
     approveNegativeStockRequest,
     rejectNegativeStockRequest,
+    deleteNegativeStockRequest,
     pendingNegativeRequestsCount,
+    deletionRequests,
+    deletionLogs,
+    pendingDeletionRequestsCount,
+    createDeletionRequest,
+    approveDeletionRequest,
+    rejectDeletionRequest,
+    settingsInitialSubTab,
+    setSettingsInitialSubTab,
   } = useApp();
 
-  const [activeSubTab, setActiveSubTab] = useState<'listas' | 'permissoes' | 'autorizacoes' | 'fotos' | 'empresa'>('listas');
+  const isPrincipalAdminMode = isRealAdmin && currentUser.isAdmin;
+
+  const [activeSubTab, setActiveSubTab] = useState<SettingsSubTab>(
+    isPrincipalAdminMode ? settingsInitialSubTab : 'fotos'
+  );
   const [noticeMessage, setNoticeMessage] = useState<{ text: string; isError?: boolean } | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+    onConfirm: () => void;
+  } | null>(null);
+
+  // Deletion modal for negative stock requests in 'autorizacoes'
+  const [deletionTarget, setDeletionTarget] = useState<DeletionTarget | null>(null);
+  const [isSubmittingDeletion, setIsSubmittingDeletion] = useState(false);
+
+  // Deletion requests filter & processing lock in 'exclusoes'
+  const [deletionStatusFilter, setDeletionStatusFilter] = useState<'TODAS' | 'PENDENTE' | 'APROVADO' | 'RECUSADO'>('TODAS');
+  const [processingDeletionReqId, setProcessingDeletionReqId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isPrincipalAdminMode) {
+      if (activeSubTab !== 'fotos') {
+        setActiveSubTab('fotos');
+      }
+    } else {
+      setActiveSubTab(settingsInitialSubTab);
+    }
+  }, [isPrincipalAdminMode, settingsInitialSubTab]);
+
+  const handleSelectSubTab = (subTab: SettingsSubTab) => {
+    if (!isPrincipalAdminMode && subTab !== 'fotos') return;
+    setActiveSubTab(subTab);
+    setSettingsInitialSubTab(subTab);
+  };
 
   // SECTION 3: List Management Form States
   const [newGroupName, setNewGroupName] = useState('');
@@ -74,26 +148,61 @@ export const SettingsTab: React.FC = () => {
   const [newDestinationName, setNewDestinationName] = useState('');
   const [editingDestinationName, setEditingDestinationName] = useState<{ oldName: string; currentVal: string } | null>(null);
 
-  // New Employee Modal State
+  // Field Collaborators (no app login) Form States
+  const [newCollabFullName, setNewCollabFullName] = useState('');
+  const [newCollabActive, setNewCollabActive] = useState(true);
+  const [isSavingCollab, setIsSavingCollab] = useState(false);
+  const [editingCollab, setEditingCollab] = useState<{
+    id: string;
+    fullName: string;
+    role?: string;
+    active: boolean;
+  } | null>(null);
+
+  // New Employee Modal State (App Login User)
   const [isAddUserModalOpen, setIsAddUserModalOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<User | null>(null);
   const [userFormData, setUserFormData] = useState({
     name: '',
     email: '',
-    role: managedLists.roles[0] || 'Técnico de Campo',
-    department: 'Operações de Campo',
+    role: managedLists.roles[0] || '',
+    department: '',
     isAdmin: false,
+    canDelete: false,
     active: true,
     permissions: {
       dashboard: false,
       produtos: true,
       entradas: false,
       saidas: true,
+      colaboradores: true,
       relatorios: false,
       estatisticas: false,
       configuracoes: false,
     } as UserPermissions,
   });
+
+  const sortedAndFilteredDeletionRequests = useMemo(() => {
+    const filtered =
+      deletionStatusFilter === 'TODAS'
+        ? deletionRequests
+        : deletionRequests.filter((r) => r.status === deletionStatusFilter);
+    return [...filtered].sort((a, b) => {
+      if (a.status === 'PENDENTE' && b.status !== 'PENDENTE') return -1;
+      if (a.status !== 'PENDENTE' && b.status === 'PENDENTE') return 1;
+      return 0;
+    });
+  }, [deletionRequests, deletionStatusFilter]);
+
+  const pendingTargetIds = useMemo(
+    () =>
+      new Set(
+        deletionRequests
+          .filter((r) => r.status === 'PENDENTE')
+          .map((r) => r.targetId)
+      ),
+    [deletionRequests]
+  );
 
   const showNotice = (text: string, isError = false) => {
     setNoticeMessage({ text, isError });
@@ -125,14 +234,18 @@ export const SettingsTab: React.FC = () => {
   };
 
   const handleDeleteGroup = (name: string) => {
-    if (window.confirm(`Confirma a exclusão do grupo "${name}"?`)) {
-      const res = deleteGroup(name);
-      if (res.success) {
-        showNotice(`Grupo "${name}" excluído.`);
-      } else {
-        showNotice(res.message || 'Não foi possível excluir.', true);
-      }
-    }
+    setConfirmDialog({
+      title: 'Excluir Grupo',
+      message: `Confirma a exclusão do grupo "${name}"?`,
+      onConfirm: () => {
+        const res = deleteGroup(name);
+        if (res.success) {
+          showNotice(`Grupo "${name}" excluído.`);
+        } else {
+          showNotice(res.message || 'Não foi possível excluir.', true);
+        }
+      },
+    });
   };
 
   // Role Handlers
@@ -158,10 +271,14 @@ export const SettingsTab: React.FC = () => {
   };
 
   const handleDeleteRole = (name: string) => {
-    if (window.confirm(`Excluir o cargo "${name}" das opções?`)) {
-      deleteRole(name);
-      showNotice(`Cargo "${name}" removido.`);
-    }
+    setConfirmDialog({
+      title: 'Excluir Cargo',
+      message: `Excluir o cargo "${name}" das opções?`,
+      onConfirm: () => {
+        deleteRole(name);
+        showNotice(`Cargo "${name}" removido.`);
+      },
+    });
   };
 
   // Destination / Obras Handlers
@@ -187,16 +304,24 @@ export const SettingsTab: React.FC = () => {
   };
 
   const handleDeleteDest = (name: string) => {
-    if (window.confirm(`Excluir a obra "${name}"?`)) {
-      deleteDestination(name);
-      showNotice(`Obra "${name}" excluída.`);
-    }
+    setConfirmDialog({
+      title: 'Excluir Obra / Destino',
+      message: `Excluir a obra "${name}"?`,
+      onConfirm: () => {
+        deleteDestination(name);
+        showNotice(`Obra "${name}" excluída.`);
+      },
+    });
   };
 
   // Permissions Toggle
   const handleTogglePermission = (user: User, tabId: TabId) => {
+    if (!isPrincipalAdminMode) {
+      showNotice('Apenas o administrador principal pode alterar permissões.', true);
+      return;
+    }
     if (user.isAdmin) {
-      alert('Administradores possuem acesso total a todas as funcionalidades.');
+      showNotice('Administradores possuem acesso total a todas as funcionalidades.', true);
       return;
     }
     const updatedPermissions: UserPermissions = {
@@ -207,13 +332,32 @@ export const SettingsTab: React.FC = () => {
     showNotice(`Permissão da aba "${tabId}" atualizada para ${user.name}`);
   };
 
+  const handleToggleDeletePermission = (user: User) => {
+    if (!isPrincipalAdminMode) {
+      showNotice('Apenas o administrador principal pode controlar a permissão de exclusão.', true);
+      return;
+    }
+    if (user.isAdmin) {
+      showNotice('O administrador principal sempre possui permissão total de exclusão.', true);
+      return;
+    }
+    const nextValue = !Boolean(user.canDelete);
+    updateUserDeletePermission(user.id, nextValue);
+    showNotice(
+      nextValue
+        ? `Permissão de exclusão direta concedida a ${user.name}.`
+        : `Permissão de exclusão direta removida de ${user.name}. Agora este usuário precisará solicitar aprovação.`
+    );
+  };
+
   const handleGrantAll = (user: User) => {
-    if (user.isAdmin) return;
+    if (!isPrincipalAdminMode || user.isAdmin) return;
     const allTrue: UserPermissions = {
       dashboard: true,
       produtos: true,
       entradas: true,
       saidas: true,
+      colaboradores: true,
       relatorios: true,
       estatisticas: true,
       configuracoes: true,
@@ -223,12 +367,13 @@ export const SettingsTab: React.FC = () => {
   };
 
   const handleRevokeAll = (user: User) => {
-    if (user.isAdmin) return;
+    if (!isPrincipalAdminMode || user.isAdmin) return;
     const allFalse: UserPermissions = {
       dashboard: false,
       produtos: false,
       entradas: false,
       saidas: false,
+      colaboradores: false,
       relatorios: false,
       estatisticas: false,
       configuracoes: false,
@@ -237,21 +382,68 @@ export const SettingsTab: React.FC = () => {
     showNotice(`Todas as abas bloqueadas para ${user.name}`);
   };
 
+  // Field Collaborators (No Login) Handlers
+  const sortedCollaborators = useMemo(() => {
+    return [...collaborators].sort((a, b) => {
+      if (a.active !== b.active) return a.active ? -1 : 1;
+      return a.fullName.localeCompare(b.fullName, 'pt-BR');
+    });
+  }, [collaborators]);
+
+  const handleAddCollaboratorSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSavingCollab) return;
+    setIsSavingCollab(true);
+    const res = await addCollaborator({
+      fullName: newCollabFullName,
+      active: newCollabActive,
+    });
+    setIsSavingCollab(false);
+    if (res.success) {
+      setNewCollabFullName('');
+      setNewCollabActive(true);
+      showNotice(res.message || 'Colaborador cadastrado com sucesso.');
+    } else {
+      showNotice(res.message || 'Erro ao cadastrar colaborador.', true);
+    }
+  };
+
+  const handleSaveEditCollaborator = async () => {
+    if (!editingCollab || isSavingCollab) return;
+    setIsSavingCollab(true);
+    const res = await updateCollaborator({
+      id: editingCollab.id,
+      fullName: editingCollab.fullName,
+      role: editingCollab.role,
+      active: editingCollab.active,
+    });
+    setIsSavingCollab(false);
+    if (res.success) {
+      setEditingCollab(null);
+      showNotice(res.message || 'Colaborador atualizado com sucesso.');
+    } else {
+      showNotice(res.message || 'Erro ao atualizar colaborador.', true);
+    }
+  };
+
   // Employee Add / Edit
   const handleOpenAddEmployee = () => {
+    if (!isPrincipalAdminMode) return;
     setEditingUser(null);
     setUserFormData({
       name: '',
       email: '',
-      role: managedLists.roles[0] || 'Técnico de Campo',
-      department: 'Operações de Campo',
+      role: managedLists.roles[0] || '',
+      department: '',
       isAdmin: false,
+      canDelete: false,
       active: true,
       permissions: {
         dashboard: false,
         produtos: true,
         entradas: false,
         saidas: true,
+        colaboradores: true,
         relatorios: false,
         estatisticas: false,
         configuracoes: false,
@@ -261,6 +453,7 @@ export const SettingsTab: React.FC = () => {
   };
 
   const handleOpenEditEmployee = (user: User) => {
+    if (!isPrincipalAdminMode) return;
     setEditingUser(user);
     setUserFormData({
       name: user.name,
@@ -268,10 +461,32 @@ export const SettingsTab: React.FC = () => {
       role: user.role,
       department: user.department,
       isAdmin: user.isAdmin,
+      canDelete: Boolean(user.isAdmin || user.canDelete),
       active: user.active,
       permissions: { ...user.permissions },
     });
     setIsAddUserModalOpen(true);
+  };
+
+  const buildUserInviteText = (name: string, email: string) => {
+    const appUrl = typeof window !== 'undefined' ? window.location.origin : '';
+    return `Olá, ${name}!\n\nSeu acesso ao Sistema de Estoque da QHS Engenharia foi liberado para o e-mail: ${email}\n\nPara entrar pela primeira vez:\n1. Acesse: ${appUrl}\n2. Clique na aba "Primeiro Acesso"\n3. Informe seu e-mail (${email}) e crie sua senha\n4. Confirme o link enviado para o seu e-mail e faça login.`;
+  };
+
+  const handleCopyUserInvite = async (user: User) => {
+    const text = buildUserInviteText(user.name, user.email);
+    try {
+      await navigator.clipboard.writeText(text);
+      showNotice(`Convite de primeiro acesso copiado para ${user.email}!`);
+    } catch {
+      showNotice('Não foi possível copiar automaticamente. Envie pelo botão de e-mail.', true);
+    }
+  };
+
+  const buildMailtoHref = (user: User) => {
+    const subject = encodeURIComponent('Convite de Acesso - Sistema de Estoque QHS Engenharia');
+    const body = encodeURIComponent(buildUserInviteText(user.name, user.email));
+    return `mailto:${user.email}?subject=${subject}&body=${body}`;
   };
 
   const handleSaveEmployee = (e: React.FormEvent) => {
@@ -288,15 +503,17 @@ export const SettingsTab: React.FC = () => {
       addUser({
         ...userFormData,
       });
-      showNotice(`Colaborador ${userFormData.name} cadastrado com sucesso!`);
+      showNotice(
+        `Usuário ${userFormData.name} cadastrado! Envie o convite para ${userFormData.email.trim().toLowerCase()} realizar o Primeiro Acesso.`
+      );
     }
 
     setIsAddUserModalOpen(false);
   };
 
   const handleToggleUserActive = (user: User) => {
-    if (user.id === 'user-admin') {
-      alert('Não é permitido inativar o Administrador principal.');
+    if (user.id === 'user-owner' || user.isAdmin) {
+      showNotice('Não é permitido inativar o Administrador principal.', true);
       return;
     }
     updateUser({ ...user, active: !user.active });
@@ -319,20 +536,27 @@ export const SettingsTab: React.FC = () => {
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => {
-              if (window.confirm('Deseja restaurar as configurações e dados de fábrica?')) {
-                resetAllData();
-                showNotice('Dados e configurações restaurados com sucesso.');
-              }
-            }}
-            className="flex items-center gap-1.5 px-3 py-2 text-xs text-zinc-600 hover:text-red-600 hover:bg-zinc-100 rounded-lg transition-colors border border-zinc-200"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            Restaurar Padrão
-          </button>
-        </div>
+        {isPrincipalAdminMode && (
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => {
+                setConfirmDialog({
+                  title: 'Limpar Todos os Dados',
+                  message:
+                    'Deseja limpar TODOS os produtos, movimentações, solicitações e cadastros de teste para zerar o aplicativo?',
+                  onConfirm: () => {
+                    resetAllData();
+                    showNotice('Todos os dados de teste foram removidos. O aplicativo está zerado.');
+                  },
+                });
+              }}
+              className="w-full sm:w-auto flex items-center justify-center gap-1.5 px-3 py-2 text-xs text-red-700 hover:bg-red-50 rounded-lg transition-colors border border-red-200 font-semibold"
+            >
+              <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+              Limpar Todos os Dados
+            </button>
+          </div>
+        )}
       </div>
 
       {noticeMessage && (
@@ -352,49 +576,82 @@ export const SettingsTab: React.FC = () => {
         </div>
       )}
 
+      {!isPrincipalAdminMode && (
+        <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3 text-xs text-amber-900">
+          <Lock className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+          <div>
+            <strong className="block font-bold">Controles Administrativos Restritos</strong>
+            <span>
+              Somente o Administrador principal pode gerenciar permissões de usuários, aprovar ou recusar solicitações de exclusão, autorizar saídas com saldo negativo ou alterar cadastros gerais.
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* Sub-tab Navigation */}
       <div className="flex flex-wrap gap-2 p-1.5 bg-zinc-100 rounded-xl">
-        <button
-          onClick={() => setActiveSubTab('listas')}
-          className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all ${
-            activeSubTab === 'listas'
-              ? 'bg-white text-zinc-900 shadow-xs'
-              : 'text-zinc-600 hover:text-zinc-900'
-          }`}
-        >
-          <ListPlus className="w-4 h-4 text-red-600" />
-          <span>Gerenciamento de Listas & Cadastros</span>
-        </button>
+        {isPrincipalAdminMode && (
+          <>
+            <button
+              onClick={() => handleSelectSubTab('listas')}
+              className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all ${
+                activeSubTab === 'listas'
+                  ? 'bg-white text-zinc-900 shadow-xs'
+                  : 'text-zinc-600 hover:text-zinc-900'
+              }`}
+            >
+              <ListPlus className="w-4 h-4 text-red-600" />
+              <span>Gerenciamento de Listas & Cadastros</span>
+            </button>
+
+            <button
+              onClick={() => handleSelectSubTab('permissoes')}
+              className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all ${
+                activeSubTab === 'permissoes'
+                  ? 'bg-white text-zinc-900 shadow-xs'
+                  : 'text-zinc-600 hover:text-zinc-900'
+              }`}
+            >
+              <Shield className="w-4 h-4 text-red-600" />
+              <span>Permissões de Usuários</span>
+            </button>
+
+            <button
+              onClick={() => handleSelectSubTab('exclusoes')}
+              className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all relative ${
+                activeSubTab === 'exclusoes'
+                  ? 'bg-white text-zinc-900 shadow-xs'
+                  : 'text-zinc-600 hover:text-zinc-900'
+              }`}
+            >
+              <History className="w-4 h-4 text-red-600" />
+              <span>Solicitações de Exclusão</span>
+              {pendingDeletionRequestsCount > 0 && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-red-600 text-white text-[10px] font-bold">
+                  {pendingDeletionRequestsCount}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => handleSelectSubTab('autorizacoes')}
+              className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all relative ${
+                activeSubTab === 'autorizacoes'
+                  ? 'bg-white text-zinc-900 shadow-xs'
+                  : 'text-zinc-600 hover:text-zinc-900'
+              }`}
+            >
+              <ShieldAlert className="w-4 h-4 text-red-600" />
+              <span>Autorizações de Estoque Negativo</span>
+              {pendingNegativeRequestsCount > 0 && (
+                <span className="w-2 h-2 rounded-full bg-red-600 animate-ping" />
+              )}
+            </button>
+          </>
+        )}
 
         <button
-          onClick={() => setActiveSubTab('permissoes')}
-          className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all ${
-            activeSubTab === 'permissoes'
-              ? 'bg-white text-zinc-900 shadow-xs'
-              : 'text-zinc-600 hover:text-zinc-900'
-          }`}
-        >
-          <Shield className="w-4 h-4 text-red-600" />
-          <span>Permissões de Abas</span>
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab('autorizacoes')}
-          className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all relative ${
-            activeSubTab === 'autorizacoes'
-              ? 'bg-white text-zinc-900 shadow-xs'
-              : 'text-zinc-600 hover:text-zinc-900'
-          }`}
-        >
-          <ShieldAlert className="w-4 h-4 text-red-600" />
-          <span>Autorizações de Estoque Negativo</span>
-          {pendingNegativeRequestsCount > 0 && (
-            <span className="w-2 h-2 rounded-full bg-red-600 animate-ping" />
-          )}
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab('fotos')}
+          onClick={() => handleSelectSubTab('fotos')}
           className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all ${
             activeSubTab === 'fotos'
               ? 'bg-white text-zinc-900 shadow-xs'
@@ -405,26 +662,28 @@ export const SettingsTab: React.FC = () => {
           <span>Fotos dos Produtos</span>
         </button>
 
-        <button
-          onClick={() => setActiveSubTab('empresa')}
-          className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all ${
-            activeSubTab === 'empresa'
-              ? 'bg-white text-zinc-900 shadow-xs'
-              : 'text-zinc-600 hover:text-zinc-900'
-          }`}
-        >
-          <Building className="w-4 h-4 text-zinc-500" />
-          <span>Dados da Empresa</span>
-        </button>
+        {isPrincipalAdminMode && (
+          <button
+            onClick={() => handleSelectSubTab('empresa')}
+            className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg transition-all ${
+              activeSubTab === 'empresa'
+                ? 'bg-white text-zinc-900 shadow-xs'
+                : 'text-zinc-600 hover:text-zinc-900'
+            }`}
+          >
+            <Building className="w-4 h-4 text-zinc-500" />
+            <span>Dados da Empresa</span>
+          </button>
+        )}
       </div>
 
       {/* SUB-TAB 1: SECTION 3 — GERENCIAMENTO DE CADASTROS E LISTAS (ÁREA CENTRALIZADA DO ADMINISTRADOR) */}
-      {activeSubTab === 'listas' && (
+      {activeSubTab === 'listas' && isPrincipalAdminMode && (
         <div className="space-y-6">
-          <div className="bg-white p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
+          <div className="bg-white p-4 sm:p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
             <div className="border-b border-zinc-100 pb-3">
               <h2 className="text-base font-bold text-zinc-900 flex items-center gap-2">
-                <ListPlus className="w-5 h-5 text-red-600" />
+                <ListPlus className="w-5 h-5 text-red-600 shrink-0" />
                 Gerenciamento Centralizado de Listas e Opções
               </h2>
               <p className="text-xs text-zinc-500 mt-1">
@@ -433,11 +692,11 @@ export const SettingsTab: React.FC = () => {
             </div>
 
             {/* 1. GRUPOS DE PRODUTOS (Materiais, Extintores, Placas + Novos Grupos) */}
-            <div className="p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
+            <div className="p-3.5 sm:p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h3 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
-                    <Layers className="w-4 h-4 text-red-600" />
+                    <Layers className="w-4 h-4 text-red-600 shrink-0" />
                     Grupos de Produtos
                   </h3>
                   <span className="text-xs text-zinc-500">
@@ -446,18 +705,18 @@ export const SettingsTab: React.FC = () => {
                 </div>
 
                 {/* Form to add group */}
-                <form onSubmit={handleAddGroupSubmit} className="flex items-center gap-2">
+                <form onSubmit={handleAddGroupSubmit} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
                   <input
                     type="text"
                     required
                     placeholder="Nome do novo grupo..."
                     value={newGroupName}
                     onChange={(e) => setNewGroupName(e.target.value)}
-                    className="px-3 py-1.5 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white"
+                    className="w-full sm:w-44 px-3 py-1.5 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white"
                   />
                   <button
                     type="submit"
-                    className="flex items-center gap-1 px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold transition-colors"
+                    className="flex items-center justify-center gap-1 px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
                   >
                     <Plus className="w-3.5 h-3.5" />
                     Adicionar Grupo
@@ -536,11 +795,11 @@ export const SettingsTab: React.FC = () => {
             </div>
 
             {/* 2. CARGOS DOS COLABORADORES */}
-            <div className="p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
+            <div className="p-3.5 sm:p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h3 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
-                    <Briefcase className="w-4 h-4 text-zinc-700" />
+                    <Briefcase className="w-4 h-4 text-zinc-700 shrink-0" />
                     Lista de Cargos
                   </h3>
                   <span className="text-xs text-zinc-500">
@@ -548,18 +807,18 @@ export const SettingsTab: React.FC = () => {
                   </span>
                 </div>
 
-                <form onSubmit={handleAddRoleSubmit} className="flex items-center gap-2">
+                <form onSubmit={handleAddRoleSubmit} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
                   <input
                     type="text"
                     required
                     placeholder="Novo cargo..."
                     value={newRoleName}
                     onChange={(e) => setNewRoleName(e.target.value)}
-                    className="px-3 py-1.5 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white"
+                    className="w-full sm:w-44 px-3 py-1.5 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white"
                   />
                   <button
                     type="submit"
-                    className="flex items-center gap-1 px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold transition-colors"
+                    className="flex items-center justify-center gap-1 px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
                   >
                     <Plus className="w-3.5 h-3.5" />
                     Adicionar Cargo
@@ -625,11 +884,11 @@ export const SettingsTab: React.FC = () => {
             </div>
 
             {/* 3. OBRAS E DESTINOS DAS SAÍDAS */}
-            <div className="p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
+            <div className="p-3.5 sm:p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h3 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
-                    <HardHat className="w-4 h-4 text-red-600" />
+                    <HardHat className="w-4 h-4 text-red-600 shrink-0" />
                     Canteiros de Obras & Locais de Destino
                   </h3>
                   <span className="text-xs text-zinc-500">
@@ -637,18 +896,18 @@ export const SettingsTab: React.FC = () => {
                   </span>
                 </div>
 
-                <form onSubmit={handleAddDestSubmit} className="flex items-center gap-2">
+                <form onSubmit={handleAddDestSubmit} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
                   <input
                     type="text"
                     required
                     placeholder="Nome da nova obra..."
                     value={newDestinationName}
                     onChange={(e) => setNewDestinationName(e.target.value)}
-                    className="px-3 py-1.5 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white"
+                    className="w-full sm:w-44 px-3 py-1.5 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white"
                   />
                   <button
                     type="submit"
-                    className="flex items-center gap-1 px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold transition-colors"
+                    className="flex items-center justify-center gap-1 px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
                   >
                     <Plus className="w-3.5 h-3.5" />
                     Adicionar Obra
@@ -718,29 +977,471 @@ export const SettingsTab: React.FC = () => {
               </div>
             </div>
 
-            {/* 4. FUNCIONÁRIOS CADASTRADOS & STATUS DE ATIVAÇÃO */}
-            <div className="p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
+            {/* 4. COLABORADORES DE OBRA (RETIRADAS — SEM ACESSO AO APLICATIVO) */}
+            <div className="p-3.5 sm:p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
+                    <Users className="w-4 h-4 text-red-600 shrink-0" />
+                    Cadastro de Colaboradores (Sem Acesso ao Aplicativo)
+                  </h3>
+                  <span className="text-xs text-zinc-500">
+                    Cadastre os funcionários da obra que aparecerão no campo <strong>"Colaborador que retirou"</strong> ao registrar saídas. Estes cadastros não criam login nem senha.
+                  </span>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('colaboradores')}
+                  className="w-full lg:w-auto flex items-center justify-center gap-1.5 px-3 py-1.5 bg-white hover:bg-zinc-100 text-zinc-800 border border-zinc-300 rounded-lg text-xs font-semibold transition-colors shrink-0"
+                >
+                  <History className="w-3.5 h-3.5 text-red-600" />
+                  Abrir Aba Colaboradores & Histórico
+                </button>
+              </div>
+
+              {/* Form: Nome Completo + Status (Ativo/Inativo) */}
+              <form
+                onSubmit={handleAddCollaboratorSubmit}
+                className="bg-white p-3.5 rounded-lg border border-zinc-200 grid grid-cols-1 sm:grid-cols-12 gap-3 items-end"
+              >
+                <div className="sm:col-span-6">
+                  <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
+                    Nome Completo do Colaborador *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={newCollabFullName}
+                    onChange={(e) => setNewCollabFullName(e.target.value)}
+                    placeholder="Ex: João Silva Santos"
+                    className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white"
+                  />
+                </div>
+
+                <div className="sm:col-span-3">
+                  <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
+                    Status *
+                  </label>
+                  <select
+                    value={newCollabActive ? 'ATIVO' : 'INATIVO'}
+                    onChange={(e) => setNewCollabActive(e.target.value === 'ATIVO')}
+                    className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white font-semibold"
+                  >
+                    <option value="ATIVO">Ativo</option>
+                    <option value="INATIVO">Inativo</option>
+                  </select>
+                </div>
+
+                <div className="sm:col-span-3">
+                  <button
+                    type="submit"
+                    disabled={isSavingCollab}
+                    className="w-full flex items-center justify-center gap-1.5 px-3.5 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    {isSavingCollab ? 'Salvando...' : 'Cadastrar Colaborador'}
+                  </button>
+                </div>
+              </form>
+
+              {/* Collaborators List */}
+              {sortedCollaborators.length === 0 ? (
+                <div className="bg-white border border-zinc-200 rounded-lg p-6 text-center text-xs text-zinc-500">
+                  Nenhum colaborador de obra cadastrado ainda. Utilize o formulário acima para cadastrar.
+                </div>
+              ) : (
+                <>
+                  {/* Mobile Cards */}
+                  <div className="md:hidden divide-y divide-zinc-200 bg-white rounded-lg border border-zinc-200">
+                    {sortedCollaborators.map((colab) => {
+                      const isEditing = editingCollab?.id === colab.id;
+                      return (
+                        <div key={colab.id} className="p-3.5 space-y-2.5 text-xs">
+                          {isEditing ? (
+                            <div className="space-y-2">
+                              <input
+                                type="text"
+                                value={editingCollab.fullName}
+                                onChange={(e) =>
+                                  setEditingCollab({ ...editingCollab, fullName: e.target.value })
+                                }
+                                className="w-full px-2.5 py-1.5 text-xs border border-red-500 rounded-lg focus:outline-none"
+                                placeholder="Nome completo"
+                              />
+                              <select
+                                value={editingCollab.active ? 'ATIVO' : 'INATIVO'}
+                                onChange={(e) =>
+                                  setEditingCollab({
+                                    ...editingCollab,
+                                    active: e.target.value === 'ATIVO',
+                                  })
+                                }
+                                className="w-full px-2.5 py-1.5 text-xs border border-zinc-300 rounded-lg bg-white font-semibold"
+                              >
+                                <option value="ATIVO">Ativo</option>
+                                <option value="INATIVO">Inativo</option>
+                              </select>
+                              <div className="flex justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingCollab(null)}
+                                  className="px-3 py-1 text-zinc-600 hover:bg-zinc-100 rounded"
+                                >
+                                  Cancelar
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={handleSaveEditCollaborator}
+                                  className="px-3 py-1 bg-emerald-600 text-white rounded font-semibold"
+                                >
+                                  Salvar
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="font-semibold text-zinc-900 truncate">
+                                  {colab.fullName}
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void toggleCollaboratorActive(colab.id).then((res) =>
+                                      showNotice(res.message || '', !res.success)
+                                    )
+                                  }
+                                  className={`mt-1.5 px-2 py-0.5 rounded text-[11px] font-semibold border ${
+                                    colab.active
+                                      ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                                      : 'bg-zinc-100 text-zinc-500 border-zinc-300'
+                                  }`}
+                                >
+                                  {colab.active ? 'Ativo' : 'Inativo'}
+                                </button>
+                              </div>
+                              <div className="flex items-center gap-1 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setEditingCollab({
+                                      id: colab.id,
+                                      fullName: colab.fullName,
+                                      role: colab.role,
+                                      active: colab.active,
+                                    })
+                                  }
+                                  className="p-1.5 text-zinc-500 hover:text-zinc-800 hover:bg-zinc-100 rounded"
+                                  title="Editar colaborador"
+                                >
+                                  <Edit2 className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setDeletionTarget({
+                                      recordType: 'COLABORADOR',
+                                      targetId: colab.id,
+                                      targetCode: '',
+                                      targetName: colab.fullName,
+                                      targetDetails: colab.role
+                                        ? `Função: ${colab.role} · Status: ${colab.active ? 'Ativo' : 'Inativo'}`
+                                        : `Colaborador de obra · Status: ${colab.active ? 'Ativo' : 'Inativo'}`,
+                                      quantity: 0,
+                                      modalTitle: 'Excluir Colaborador',
+                                      summaryText: (
+                                        <>
+                                          Deseja excluir o colaborador{' '}
+                                          <strong className="text-zinc-900">"{colab.fullName}"</strong>{' '}
+                                          do cadastro? O histórico de movimentações e quantidades de estoque será preservado.
+                                        </>
+                                      ),
+                                    })
+                                  }
+                                  className={`p-1.5 rounded ${
+                                    pendingTargetIds.has(colab.id)
+                                      ? 'text-amber-600 bg-amber-50 hover:bg-amber-100'
+                                      : 'text-zinc-400 hover:text-red-600 hover:bg-red-50'
+                                  }`}
+                                  title={
+                                    canDeleteDirectly
+                                      ? 'Excluir colaborador'
+                                      : pendingTargetIds.has(colab.id)
+                                      ? 'Solicitação de exclusão pendente'
+                                      : 'Solicitar exclusão do colaborador'
+                                  }
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Desktop Table */}
+                  <div className="hidden md:block overflow-x-auto bg-white rounded-lg border border-zinc-200">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-zinc-100 text-zinc-700 font-semibold border-b border-zinc-200">
+                        <tr>
+                          <th className="py-2.5 px-3">Nome Completo</th>
+                          <th className="py-2.5 px-3">Status</th>
+                          <th className="py-2.5 px-3 text-right">Ações</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-zinc-200">
+                        {sortedCollaborators.map((colab) => {
+                          const isEditing = editingCollab?.id === colab.id;
+                          return (
+                            <tr key={colab.id} className="hover:bg-zinc-50">
+                              <td className="py-2.5 px-3 font-semibold text-zinc-900">
+                                {isEditing ? (
+                                  <input
+                                    type="text"
+                                    value={editingCollab.fullName}
+                                    onChange={(e) =>
+                                      setEditingCollab({
+                                        ...editingCollab,
+                                        fullName: e.target.value,
+                                      })
+                                    }
+                                    className="w-full max-w-sm px-2.5 py-1 text-xs border border-red-500 rounded focus:outline-none"
+                                    autoFocus
+                                  />
+                                ) : (
+                                  colab.fullName
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                {isEditing ? (
+                                  <select
+                                    value={editingCollab.active ? 'ATIVO' : 'INATIVO'}
+                                    onChange={(e) =>
+                                      setEditingCollab({
+                                        ...editingCollab,
+                                        active: e.target.value === 'ATIVO',
+                                      })
+                                    }
+                                    className="px-2.5 py-1 text-xs border border-zinc-300 rounded bg-white font-semibold"
+                                  >
+                                    <option value="ATIVO">Ativo</option>
+                                    <option value="INATIVO">Inativo</option>
+                                  </select>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      void toggleCollaboratorActive(colab.id).then((res) =>
+                                        showNotice(res.message || '', !res.success)
+                                      )
+                                    }
+                                    className={`px-2.5 py-0.5 rounded text-[11px] font-semibold border transition-colors ${
+                                      colab.active
+                                        ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                                        : 'bg-zinc-100 text-zinc-500 border-zinc-300 hover:bg-zinc-200'
+                                    }`}
+                                    title="Clique para alternar entre Ativo e Inativo"
+                                  >
+                                    {colab.active ? 'Ativo' : 'Inativo'}
+                                  </button>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                                {isEditing ? (
+                                  <div className="inline-flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={handleSaveEditCollaborator}
+                                      className="p-1 text-emerald-600 hover:bg-emerald-50 rounded"
+                                      title="Salvar alterações"
+                                    >
+                                      <Check className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingCollab(null)}
+                                      className="p-1 text-zinc-400 hover:bg-zinc-100 rounded"
+                                      title="Cancelar"
+                                    >
+                                      <X className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <div className="inline-flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setEditingCollab({
+                                          id: colab.id,
+                                          fullName: colab.fullName,
+                                          role: colab.role,
+                                          active: colab.active,
+                                        })
+                                      }
+                                      className="p-1 text-zinc-500 hover:text-zinc-800 hover:bg-zinc-100 rounded"
+                                      title="Editar colaborador"
+                                    >
+                                      <Edit2 className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setDeletionTarget({
+                                          recordType: 'COLABORADOR',
+                                          targetId: colab.id,
+                                          targetCode: '',
+                                          targetName: colab.fullName,
+                                          targetDetails: colab.role
+                                            ? `Função: ${colab.role} · Status: ${colab.active ? 'Ativo' : 'Inativo'}`
+                                            : `Colaborador de obra · Status: ${colab.active ? 'Ativo' : 'Inativo'}`,
+                                          quantity: 0,
+                                          modalTitle: 'Excluir Colaborador',
+                                          summaryText: (
+                                            <>
+                                              Deseja excluir o colaborador{' '}
+                                              <strong className="text-zinc-900">"{colab.fullName}"</strong>{' '}
+                                              do cadastro? O histórico de movimentações e quantidades de estoque será preservado.
+                                            </>
+                                          ),
+                                        })
+                                      }
+                                      className={`p-1 rounded ${
+                                        pendingTargetIds.has(colab.id)
+                                          ? 'text-amber-600 bg-amber-50 hover:bg-amber-100'
+                                          : 'text-zinc-400 hover:text-red-600 hover:bg-red-50'
+                                      }`}
+                                      title={
+                                        canDeleteDirectly
+                                          ? 'Excluir colaborador'
+                                          : pendingTargetIds.has(colab.id)
+                                          ? 'Solicitação de exclusão pendente'
+                                          : 'Solicitar exclusão do colaborador'
+                                      }
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* 5. USUÁRIOS DO SISTEMA (ACESSO AO APLICATIVO & PERMISSÕES) */}
+            <div className="p-3.5 sm:p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h3 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
-                    <UserCheck className="w-4 h-4 text-zinc-700" />
-                    Gerenciamento de Funcionários (Retiradas & Responsáveis)
+                    <UserCheck className="w-4 h-4 text-zinc-700 shrink-0" />
+                    Usuários com Acesso ao Aplicativo (Login & Permissões)
                   </h3>
                   <span className="text-xs text-zinc-500">
-                    Colaboradores que aparecem na seleção de <strong>"Funcionário que retirou o material"</strong> e lançadores de movimentações.
+                    Contas autorizadas por e-mail para acessar o sistema (Primeiro Acesso via E-mail/Senha ou Google), registrar movimentações e gerenciar o estoque.
                   </span>
                 </div>
 
                 <button
                   onClick={handleOpenAddEmployee}
-                  className="flex items-center gap-1.5 px-3.5 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold transition-colors"
+                  className="w-full sm:w-auto flex items-center justify-center gap-1.5 px-3.5 py-2 sm:py-1.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold transition-colors shrink-0"
                 >
                   <UserPlus className="w-3.5 h-3.5" />
-                  Cadastrar Colaborador
+                  Cadastrar Usuário do Sistema
                 </button>
               </div>
 
-              <div className="overflow-x-auto bg-white rounded-lg border border-zinc-200">
+              {/* Mobile Employee Cards */}
+              <div className="md:hidden divide-y divide-zinc-200 bg-white rounded-lg border border-zinc-200">
+                {users.map((user) => (
+                  <div key={user.id} className="p-3.5 space-y-2 text-xs">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="font-semibold text-zinc-900 flex items-center gap-1.5 flex-wrap">
+                          <span>{user.name}</span>
+                          {user.isAdmin && (
+                            <span className="text-[9px] bg-red-600 text-white px-1.5 py-0.2 rounded font-bold">
+                              ADMIN
+                            </span>
+                          )}
+                          {!user.isAdmin && user.canDelete && (
+                            <span className="text-[9px] bg-emerald-100 text-emerald-800 border border-emerald-200 px-1.5 py-0.2 rounded font-bold">
+                              Exclusão Direta
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-zinc-500 mt-0.5">
+                          {user.role || '-'} {user.department ? `· ${user.department}` : ''}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleCopyUserInvite(user)}
+                          className="p-1.5 text-zinc-500 hover:text-zinc-900 hover:bg-zinc-100 rounded"
+                          title="Copiar convite de primeiro acesso"
+                        >
+                          <Copy className="w-3.5 h-3.5" />
+                        </button>
+                        <a
+                          href={buildMailtoHref(user)}
+                          className="p-1.5 text-zinc-500 hover:text-red-600 hover:bg-red-50 rounded"
+                          title="Enviar convite por e-mail"
+                        >
+                          <Mail className="w-3.5 h-3.5" />
+                        </a>
+                        <button
+                          onClick={() => handleOpenEditEmployee(user)}
+                          className="p-1.5 text-zinc-500 hover:text-zinc-800 hover:bg-zinc-100 rounded"
+                          title="Editar funcionário"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                        </button>
+                        {!user.isAdmin && (
+                          <button
+                            onClick={() => {
+                              setConfirmDialog({
+                                title: 'Excluir Funcionário',
+                                message: `Excluir o funcionário "${user.name}"?`,
+                                onConfirm: () => {
+                                  deleteUser(user.id);
+                                  showNotice(`Funcionário "${user.name}" excluído.`);
+                                },
+                              });
+                            }}
+                            className="p-1.5 text-zinc-400 hover:text-red-600 hover:bg-red-50 rounded"
+                            title="Excluir funcionário"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <button
+                        onClick={() => handleToggleUserActive(user)}
+                        className={`px-2.5 py-1 rounded text-[11px] font-semibold border transition-colors ${
+                          user.active
+                            ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                            : 'bg-zinc-100 text-zinc-500 border-zinc-300 hover:bg-zinc-200'
+                        }`}
+                      >
+                        {user.active ? 'Ativo na Lista' : 'Inativo (Oculto)'}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Desktop Employee Table */}
+              <div className="hidden md:block overflow-x-auto bg-white rounded-lg border border-zinc-200">
                 <table className="w-full text-left text-xs">
                   <thead className="bg-zinc-100 text-zinc-700 font-semibold border-b border-zinc-200">
                     <tr>
@@ -759,6 +1460,11 @@ export const SettingsTab: React.FC = () => {
                           {user.isAdmin && (
                             <span className="ml-1.5 text-[9px] bg-red-600 text-white px-1.5 py-0.2 rounded font-bold">
                               ADMIN
+                            </span>
+                          )}
+                          {!user.isAdmin && user.canDelete && (
+                            <span className="ml-1.5 text-[9px] bg-emerald-100 text-emerald-800 border border-emerald-200 px-1.5 py-0.2 rounded font-bold">
+                              Exclusão Direta
                             </span>
                           )}
                         </td>
@@ -780,6 +1486,22 @@ export const SettingsTab: React.FC = () => {
                         <td className="py-2.5 px-3 text-right whitespace-nowrap">
                           <div className="flex items-center justify-end gap-1.5">
                             <button
+                              type="button"
+                              onClick={() => handleCopyUserInvite(user)}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-zinc-700 bg-zinc-100 hover:bg-zinc-200 rounded transition-colors"
+                              title="Copiar instruções de primeiro acesso para enviar ao usuário"
+                            >
+                              <Copy className="w-3 h-3" />
+                              Convite
+                            </button>
+                            <a
+                              href={buildMailtoHref(user)}
+                              className="p-1 text-zinc-500 hover:text-red-600 hover:bg-red-50 rounded"
+                              title={`Abrir e-mail para ${user.email}`}
+                            >
+                              <Mail className="w-3.5 h-3.5" />
+                            </a>
+                            <button
                               onClick={() => handleOpenEditEmployee(user)}
                               className="p-1 text-zinc-500 hover:text-zinc-800 hover:bg-zinc-100 rounded"
                               title="Editar funcionário"
@@ -789,10 +1511,14 @@ export const SettingsTab: React.FC = () => {
                             {!user.isAdmin && (
                               <button
                                 onClick={() => {
-                                  if (window.confirm(`Excluir o funcionário "${user.name}"?`)) {
-                                    deleteUser(user.id);
-                                    showNotice(`Funcionário "${user.name}" excluído.`);
-                                  }
+                                  setConfirmDialog({
+                                    title: 'Excluir Funcionário',
+                                    message: `Excluir o funcionário "${user.name}"?`,
+                                    onConfirm: () => {
+                                      deleteUser(user.id);
+                                      showNotice(`Funcionário "${user.name}" excluído.`);
+                                    },
+                                  });
                                 }}
                                 className="p-1 text-zinc-400 hover:text-red-600 hover:bg-red-50 rounded"
                                 title="Excluir funcionário"
@@ -812,36 +1538,159 @@ export const SettingsTab: React.FC = () => {
         </div>
       )}
 
-      {/* SUB-TAB 2: PERMISSÕES INDIVIDUAIS DE ABAS */}
-      {activeSubTab === 'permissoes' && (
-        <div className="bg-white p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
+      {/* SUB-TAB 2: PERMISSÕES INDIVIDUAIS DE USUÁRIOS */}
+      {activeSubTab === 'permissoes' && isPrincipalAdminMode && (
+        <div className="bg-white p-4 sm:p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
           <div className="border-b border-zinc-100 pb-3">
             <h2 className="text-sm font-bold text-zinc-900">
               Matriz de Permissões Individuais por Funcionário
             </h2>
             <p className="text-xs text-zinc-500 mt-0.5">
-              Como administrador, você pode liberar ou bloquear o acesso a cada uma das 7 abas do sistema para cada colaborador individualmente.
+              Como administrador principal, você pode liberar ou bloquear o acesso a cada aba e controlar individualmente quem tem permissão para excluir registros diretamente sem precisar solicitar aprovação.
             </p>
           </div>
 
-          <div className="overflow-x-auto">
+          {/* Mobile & Tablet Permission Cards */}
+          <div className="lg:hidden space-y-4">
+            {users.map((user) => {
+              const isCurrentUser = user.id === currentUser.id;
+              const hasDirectDelete = user.isAdmin || Boolean(user.canDelete);
+              return (
+                <div key={user.id} className="p-4 rounded-xl border border-zinc-200 bg-zinc-50/70 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-zinc-200">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div
+                        className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs shrink-0 ${
+                          user.isAdmin ? 'bg-red-600 text-white' : 'bg-zinc-800 text-white'
+                        }`}
+                      >
+                        {user.name.charAt(0)}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="font-semibold text-xs text-zinc-900 flex items-center gap-1.5 flex-wrap">
+                          <span className="truncate">{user.name}</span>
+                          {user.isAdmin && (
+                            <span className="text-[10px] bg-red-600 text-white px-1.5 py-0.2 rounded font-bold">
+                              ADMIN
+                            </span>
+                          )}
+                          {isCurrentUser && (
+                            <span className="text-[10px] bg-emerald-100 text-emerald-800 px-1 py-0.2 rounded font-medium">
+                              Você
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-zinc-500 truncate">
+                          {user.role} {user.department ? `· ${user.department}` : ''}
+                        </div>
+                      </div>
+                    </div>
+
+                    {user.isAdmin ? (
+                      <span className="text-[11px] font-semibold text-zinc-500">Acesso Pleno</span>
+                    ) : (
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => handleGrantAll(user)}
+                          className="px-2.5 py-1 text-[11px] text-emerald-700 bg-white hover:bg-emerald-50 rounded border border-emerald-200 font-medium"
+                        >
+                          Liberar Todas
+                        </button>
+                        <button
+                          onClick={() => handleRevokeAll(user)}
+                          className="px-2.5 py-1 text-[11px] text-red-700 bg-white hover:bg-red-50 rounded border border-red-200 font-medium"
+                        >
+                          Bloquear
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Individual Direct Deletion Permission Toggle */}
+                  <div className="flex items-center justify-between gap-2 p-2.5 rounded-lg bg-white border border-zinc-200">
+                    <div>
+                      <span className="block text-xs font-bold text-zinc-900">
+                        Exclusão Direta de Registros
+                      </span>
+                      <span className="block text-[11px] text-zinc-500">
+                        {hasDirectDelete
+                          ? 'Pode excluir produtos, entradas, saídas e colaboradores diretamente.'
+                          : 'Precisa solicitar exclusão com justificativa para sua aprovação.'}
+                      </span>
+                    </div>
+                    {user.isAdmin ? (
+                      <span className="px-2.5 py-1 rounded text-[11px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200 shrink-0">
+                        Sempre Ativa
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handleToggleDeletePermission(user)}
+                        className={`px-3 py-1.5 rounded-lg text-[11px] font-bold border transition-colors shrink-0 ${
+                          hasDirectDelete
+                            ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                            : 'bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100'
+                        }`}
+                      >
+                        {hasDirectDelete ? 'Permitida' : 'Solicita Aprovação'}
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                    {TAB_CONFIGS.map((tab) => {
+                      const isAllowed = user.isAdmin || user.permissions[tab.id];
+                      return (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          disabled={user.isAdmin}
+                          onClick={() => handleTogglePermission(user, tab.id)}
+                          className={`flex items-center justify-between gap-1.5 px-2.5 py-2 rounded-lg border text-xs font-medium transition-all ${
+                            user.isAdmin
+                              ? 'bg-emerald-50 text-emerald-800 border-emerald-200 cursor-not-allowed'
+                              : isAllowed
+                              ? 'bg-emerald-600 text-white border-emerald-600'
+                              : 'bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-100'
+                          }`}
+                        >
+                          <span className="truncate">{tab.label}</span>
+                          {isAllowed ? (
+                            <Check className="w-3.5 h-3.5 shrink-0 stroke-[3]" />
+                          ) : (
+                            <X className="w-3.5 h-3.5 shrink-0" />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Desktop Matrix Table */}
+          <div className="hidden lg:block overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="bg-zinc-900 text-white font-semibold">
                 <tr>
-                  <th className="py-3 px-4 min-w-[200px]">Colaborador</th>
+                  <th className="py-3 px-4 min-w-[200px]">Usuário</th>
                   <th className="py-3 px-3 text-center">Dashboard</th>
                   <th className="py-3 px-3 text-center">Produtos</th>
                   <th className="py-3 px-3 text-center">Entradas</th>
                   <th className="py-3 px-3 text-center">Saídas</th>
+                  <th className="py-3 px-3 text-center">Colaboradores</th>
                   <th className="py-3 px-3 text-center">Relatórios</th>
                   <th className="py-3 px-3 text-center">Estatísticas</th>
                   <th className="py-3 px-3 text-center">Configurações</th>
+                  <th className="py-3 px-3 text-center whitespace-nowrap">Excluir Direto</th>
                   <th className="py-3 px-3 text-right">Ações Rápidas</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-200">
                 {users.map((user) => {
                   const isCurrentUser = user.id === currentUser.id;
+                  const hasDirectDelete = user.isAdmin || Boolean(user.canDelete);
 
                   return (
                     <tr key={user.id} className="hover:bg-zinc-50 transition-colors">
@@ -910,6 +1759,46 @@ export const SettingsTab: React.FC = () => {
                         );
                       })}
 
+                      {/* Individual Direct Delete Permission */}
+                      <td className="py-3 px-3 text-center whitespace-nowrap">
+                        {user.isAdmin ? (
+                          <span
+                            title="Administrador principal sempre pode excluir diretamente"
+                            className="inline-flex items-center gap-1 px-2.5 py-1 bg-emerald-50 text-emerald-700 rounded-md border border-emerald-200 text-[11px] font-semibold cursor-not-allowed"
+                          >
+                            <Check className="w-3.5 h-3.5 stroke-[3]" />
+                            Total
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => handleToggleDeletePermission(user)}
+                            title={
+                              hasDirectDelete
+                                ? 'Clique para revogar a exclusão direta (passará a solicitar aprovação)'
+                                : 'Clique para conceder permissão de exclusão direta sem aprovação'
+                            }
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md border text-[11px] font-semibold transition-all ${
+                              hasDirectDelete
+                                ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                                : 'bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100'
+                            }`}
+                          >
+                            {hasDirectDelete ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 stroke-[3]" />
+                                Direto
+                              </>
+                            ) : (
+                              <>
+                                <Lock className="w-3 h-3" />
+                                Solicita
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </td>
+
                       {/* Presets */}
                       <td className="py-3 px-3 text-right whitespace-nowrap">
                         {user.isAdmin ? (
@@ -942,12 +1831,309 @@ export const SettingsTab: React.FC = () => {
         </div>
       )}
 
+      {/* SUB-TAB: SOLICITAÇÕES DE EXCLUSÃO & HISTÓRICO DE AUDITORIA (EXCLUSIVO DO ADMINISTRADOR PRINCIPAL) */}
+      {activeSubTab === 'exclusoes' && isPrincipalAdminMode && (
+        <div className="space-y-6">
+          {/* Request Queue Card */}
+          <div className="bg-white p-4 sm:p-6 rounded-xl border border-zinc-200 shadow-xs space-y-5">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-zinc-100 pb-3">
+              <div>
+                <h2 className="text-base font-bold text-zinc-900 flex items-center gap-2">
+                  <ShieldCheck className="w-5 h-5 text-red-600 shrink-0" />
+                  Solicitações de Exclusão de Registros
+                </h2>
+                <p className="text-xs text-zinc-500 mt-1">
+                  Analise pedidos enviados por usuários sem permissão direta. Ao aprovar, o registro é excluído com estorno automático de estoque; ao recusar, o registro permanece intacto.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5 bg-zinc-100 p-1 rounded-lg">
+                {(
+                  [
+                    { key: 'TODAS', label: `Todas (${deletionRequests.length})` },
+                    { key: 'PENDENTE', label: `Pendentes (${pendingDeletionRequestsCount})` },
+                    {
+                      key: 'APROVADO',
+                      label: `Aprovadas (${deletionRequests.filter((r) => r.status === 'APROVADO').length})`,
+                    },
+                    {
+                      key: 'RECUSADO',
+                      label: `Recusadas (${deletionRequests.filter((r) => r.status === 'RECUSADO').length})`,
+                    },
+                  ] as const
+                ).map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setDeletionStatusFilter(item.key)}
+                    className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-colors ${
+                      deletionStatusFilter === item.key
+                        ? 'bg-white text-zinc-900 shadow-2xs'
+                        : 'text-zinc-600 hover:text-zinc-900'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {sortedAndFilteredDeletionRequests.length === 0 ? (
+              <p className="text-xs text-zinc-500 py-8 text-center">
+                Nenhuma solicitação de exclusão encontrada para este filtro.
+              </p>
+            ) : (
+              <div className="space-y-4">
+                {sortedAndFilteredDeletionRequests.map((req) => {
+                  const isProcessing = processingDeletionReqId === req.id;
+                  return (
+                    <div
+                      key={req.id}
+                      className={`p-3.5 sm:p-4 rounded-xl border space-y-3 ${
+                        req.status === 'PENDENTE'
+                          ? 'bg-amber-50/60 border-amber-300'
+                          : req.status === 'APROVADO'
+                          ? 'bg-emerald-50/40 border-emerald-200'
+                          : 'bg-zinc-50 border-zinc-200'
+                      }`}
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-2 min-w-0">
+                          <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-zinc-900 text-white shrink-0">
+                            {getRecordTypeLabel(req.recordType)}
+                          </span>
+                          {req.targetCode && (
+                            <span className="font-mono font-bold text-xs bg-white px-2 py-0.5 rounded border border-zinc-300 shrink-0">
+                              {req.targetCode}
+                            </span>
+                          )}
+                          <strong className="text-sm text-zinc-900">{req.targetName}</strong>
+                          {req.recordType === 'COLABORADOR' ? (
+                            req.quantity > 0 && (
+                              <span className="font-mono text-xs font-semibold text-zinc-700">
+                                ({req.quantity} retirada{req.quantity === 1 ? '' : 's'})
+                              </span>
+                            )
+                          ) : (
+                            <span className="font-mono text-xs font-semibold text-zinc-700">
+                              ({req.quantity} un)
+                            </span>
+                          )}
+                        </div>
+
+                        <span
+                          className={`text-[11px] font-bold px-2.5 py-0.5 rounded uppercase self-start sm:self-auto shrink-0 ${
+                            req.status === 'PENDENTE'
+                              ? 'bg-amber-200 text-amber-900'
+                              : req.status === 'APROVADO'
+                              ? 'bg-emerald-200 text-emerald-900'
+                              : 'bg-zinc-200 text-zinc-700'
+                          }`}
+                        >
+                          {req.status}
+                        </span>
+                      </div>
+
+                      {req.targetDetails && (
+                        <div className="text-xs text-zinc-600">{req.targetDetails}</div>
+                      )}
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-zinc-700 bg-white p-3 rounded-lg border border-zinc-200">
+                        <div>
+                          <span className="text-zinc-500 block">Solicitado Por:</span>
+                          <strong>{req.requestedBy}</strong>
+                          <span className="block text-[11px] text-zinc-500 truncate">{req.requestedByEmail}</span>
+                        </div>
+                        <div>
+                          <span className="text-zinc-500 block">Data da Solicitação:</span>
+                          <strong className="font-mono">{req.date}</strong>
+                        </div>
+                        {req.reviewedBy ? (
+                          <div>
+                            <span className="text-zinc-500 block">
+                              {req.status === 'APROVADO' ? 'Aprovado Por:' : 'Recusado Por:'}
+                            </span>
+                            <strong
+                              className={
+                                req.status === 'APROVADO' ? 'text-emerald-800' : 'text-zinc-800'
+                              }
+                            >
+                              {req.reviewedBy}
+                            </strong>
+                            <span className="block text-[11px] text-zinc-500 font-mono">
+                              em {req.reviewedAt}
+                            </span>
+                          </div>
+                        ) : (
+                          <div>
+                            <span className="text-zinc-500 block">Situação:</span>
+                            <strong className="text-amber-800">Aguardando aprovação</strong>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="text-xs text-zinc-700 bg-white p-2.5 rounded-lg border border-zinc-200">
+                        <strong className="text-zinc-900">Justificativa informada: </strong>
+                        {req.reason}
+                      </div>
+
+                      {req.status === 'PENDENTE' && (
+                        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-end gap-2 pt-2 border-t border-amber-200">
+                          <button
+                            type="button"
+                            disabled={isProcessing}
+                            onClick={() => {
+                              setProcessingDeletionReqId(req.id);
+                              void approveDeletionRequest(req.id)
+                                .then((res) => {
+                                  showNotice(
+                                    res.message ||
+                                      (res.success
+                                        ? 'Solicitação aprovada e exclusão executada.'
+                                        : 'Erro ao aprovar solicitação.'),
+                                    !res.success
+                                  );
+                                })
+                                .finally(() => setProcessingDeletionReqId(null));
+                            }}
+                            className="px-4 py-2 sm:py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors text-center disabled:opacity-50"
+                          >
+                            {isProcessing ? 'Executando Exclusão...' : 'Aprovar e Excluir Registro'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isProcessing}
+                            onClick={() => {
+                              setProcessingDeletionReqId(req.id);
+                              void rejectDeletionRequest(req.id)
+                                .then((res) => {
+                                  showNotice(
+                                    res.message ||
+                                      (res.success
+                                        ? 'Solicitação recusada.'
+                                        : 'Erro ao recusar solicitação.'),
+                                    !res.success
+                                  );
+                                })
+                                .finally(() => setProcessingDeletionReqId(null));
+                            }}
+                            className="px-3.5 py-2 sm:py-1.5 bg-zinc-200 hover:bg-zinc-300 text-zinc-800 rounded-lg text-xs font-semibold transition-colors text-center disabled:opacity-50"
+                          >
+                            Recusar Solicitação
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Permanent Audit Log Section */}
+          <div className="bg-white p-4 sm:p-6 rounded-xl border border-zinc-200 shadow-xs space-y-4">
+            <div className="border-b border-zinc-100 pb-3">
+              <h2 className="text-base font-bold text-zinc-900 flex items-center gap-2">
+                <History className="w-5 h-5 text-zinc-700 shrink-0" />
+                Histórico e Auditoria de Exclusões Realizadas
+              </h2>
+              <p className="text-xs text-zinc-500 mt-1">
+                Registro completo de quem solicitou, justificativa, quem aprovou e quem efetivamente realizou cada exclusão no sistema.
+              </p>
+            </div>
+
+            {deletionLogs.length === 0 ? (
+              <p className="text-xs text-zinc-500 py-8 text-center">
+                Nenhuma exclusão auditada foi registrada até o momento.
+              </p>
+            ) : (
+              <div className="space-y-3">
+                {deletionLogs.map((log) => (
+                  <div
+                    key={log.id}
+                    className="p-3.5 rounded-xl border border-zinc-200 bg-zinc-50/70 space-y-2.5 text-xs"
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2 min-w-0">
+                        <span
+                          className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase shrink-0 ${
+                            log.origin === 'APROVADA'
+                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                              : 'bg-zinc-200 text-zinc-800 border border-zinc-300'
+                          }`}
+                        >
+                          {log.origin === 'APROVADA' ? 'Via Solicitação Aprovada' : 'Exclusão Direta'}
+                        </span>
+                        <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-zinc-900 text-white shrink-0">
+                          {getRecordTypeLabel(log.recordType)}
+                        </span>
+                        {log.targetCode && (
+                          <span className="font-mono font-bold bg-white px-2 py-0.5 rounded border border-zinc-300 shrink-0">
+                            {log.targetCode}
+                          </span>
+                        )}
+                        <strong className="text-zinc-900">{log.targetName}</strong>
+                        {log.recordType === 'COLABORADOR' ? (
+                          log.quantity > 0 && (
+                            <span className="font-mono text-zinc-600">
+                              ({log.quantity} retirada{log.quantity === 1 ? '' : 's'})
+                            </span>
+                          )
+                        ) : (
+                          <span className="font-mono text-zinc-600">({log.quantity} un)</span>
+                        )}
+                      </div>
+                      <span className="text-[11px] font-mono text-zinc-500 shrink-0">
+                        {log.deletedAt}
+                      </span>
+                    </div>
+
+                    {log.targetDetails && (
+                      <div className="text-[11px] text-zinc-600">{log.targetDetails}</div>
+                    )}
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 bg-white p-2.5 rounded-lg border border-zinc-200 text-[11px]">
+                      <div>
+                        <span className="text-zinc-500 block">Solicitado por:</span>
+                        <strong className="text-zinc-900">{log.requestedBy}</strong>
+                        <span className="block text-zinc-500 font-mono">{log.requestedByDate}</span>
+                      </div>
+                      <div>
+                        <span className="text-zinc-500 block">Aprovação:</span>
+                        {log.origin === 'APROVADA' && log.approvedBy ? (
+                          <>
+                            <strong className="text-emerald-800">{log.approvedBy}</strong>
+                            <span className="block text-zinc-500 font-mono">{log.approvedAt}</span>
+                          </>
+                        ) : (
+                          <strong className="text-zinc-700">Não necessária (Permissão Direta)</strong>
+                        )}
+                      </div>
+                      <div>
+                        <span className="text-zinc-500 block">Excluído por:</span>
+                        <strong className="text-red-700">{log.deletedBy}</strong>
+                        <span className="block text-zinc-500 truncate">{log.deletedByEmail}</span>
+                      </div>
+                    </div>
+
+                    <div className="text-[11px] text-zinc-700 bg-white px-2.5 py-2 rounded border border-zinc-200">
+                      <strong className="text-zinc-900">Justificativa: </strong>
+                      {log.reason}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* SUB-TAB 3: SECTION 7 — AUTORIZAÇÕES DE ESTOQUE NEGATIVO (EXCLUSIVO DO ADMINISTRADOR) */}
-      {activeSubTab === 'autorizacoes' && (
-        <div className="bg-white p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
+      {activeSubTab === 'autorizacoes' && isPrincipalAdminMode && (
+        <div className="bg-white p-4 sm:p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
           <div className="border-b border-zinc-100 pb-3">
             <h2 className="text-base font-bold text-zinc-900 flex items-center gap-2">
-              <ShieldAlert className="w-5 h-5 text-red-600" />
+              <ShieldAlert className="w-5 h-5 text-red-600 shrink-0" />
               Gestão de Solicitações de Saída com Saldo Negativo
             </h2>
             <p className="text-xs text-zinc-500 mt-1">
@@ -964,7 +2150,7 @@ export const SettingsTab: React.FC = () => {
               negativeRequests.map((req) => (
                 <div
                   key={req.id}
-                  className={`p-4 rounded-xl border space-y-3 ${
+                  className={`p-3.5 sm:p-4 rounded-xl border space-y-3 ${
                     req.status === 'PENDENTE'
                       ? 'bg-amber-50/60 border-amber-300'
                       : req.status === 'APROVADO'
@@ -973,25 +2159,66 @@ export const SettingsTab: React.FC = () => {
                   }`}
                 >
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono font-bold text-xs bg-white px-2 py-0.5 rounded border border-zinc-300">
+                    <div className="flex flex-wrap items-center gap-2 min-w-0">
+                      <span className="font-mono font-bold text-xs bg-white px-2 py-0.5 rounded border border-zinc-300 shrink-0">
                         {req.productCode}
                       </span>
                       <strong className="text-sm text-zinc-900">{req.productName}</strong>
                       <span className="text-xs text-zinc-500 font-mono">({req.group})</span>
                     </div>
 
-                    <span
-                      className={`text-[11px] font-bold px-2.5 py-0.5 rounded uppercase ${
-                        req.status === 'PENDENTE'
-                          ? 'bg-amber-200 text-amber-900'
-                          : req.status === 'APROVADO'
-                          ? 'bg-emerald-200 text-emerald-900'
-                          : 'bg-zinc-200 text-zinc-700'
-                      }`}
-                    >
-                      {req.status}
-                    </span>
+                    <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
+                      <span
+                        className={`text-[11px] font-bold px-2.5 py-0.5 rounded uppercase ${
+                          req.status === 'PENDENTE'
+                            ? 'bg-amber-200 text-amber-900'
+                            : req.status === 'APROVADO'
+                            ? 'bg-emerald-200 text-emerald-900'
+                            : 'bg-zinc-200 text-zinc-700'
+                        }`}
+                      >
+                        {req.status}
+                      </span>
+                      <button
+                        type="button"
+                        title={
+                          pendingTargetIds.has(req.id)
+                            ? 'Já existe solicitação de exclusão pendente'
+                            : canDeleteDirectly
+                            ? 'Excluir registro de solicitação'
+                            : 'Solicitar exclusão ao Administrador'
+                        }
+                        onClick={() =>
+                          setDeletionTarget({
+                            recordType: 'SOLICITACAO_NEGATIVA',
+                            targetId: req.id,
+                            targetCode: req.productCode,
+                            targetName: req.productName,
+                            targetDetails: `Status: ${req.status} · Retirada: ${req.withdrawnBy} · Obra: ${req.destination}`,
+                            quantity: req.requestedQuantity,
+                            modalTitle: 'Excluir Solicitação de Estoque Negativo',
+                            summaryText: (
+                              <p>
+                                Registro da solicitação de <strong>{req.productName}</strong> ({req.requestedQuantity} un · Obra: {req.destination}).
+                              </p>
+                            ),
+                            stockImpactWarning:
+                              req.status === 'APROVADO' ? (
+                                <span>
+                                  Para estornar a quantidade que saiu do estoque, exclua também a saída correspondente na aba Saídas ou Relatórios.
+                                </span>
+                              ) : undefined,
+                          })
+                        }
+                        className={`p-1.5 rounded-lg transition-colors ${
+                          pendingTargetIds.has(req.id)
+                            ? 'text-amber-600 bg-amber-50 hover:bg-amber-100'
+                            : 'text-zinc-400 hover:text-red-600 hover:bg-red-50'
+                        }`}
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-zinc-700 bg-white p-3 rounded-lg border border-zinc-200">
@@ -1008,7 +2235,7 @@ export const SettingsTab: React.FC = () => {
                       <strong>{req.destination}</strong>
                     </div>
                     <div>
-                      <span className="text-zinc-500 block">Funcionário que Retirará:</span>
+                      <span className="text-zinc-500 block">Colaborador que Retirou:</span>
                       <strong>{req.withdrawnBy}</strong>
                     </div>
                     <div>
@@ -1030,7 +2257,7 @@ export const SettingsTab: React.FC = () => {
                   )}
 
                   {req.status === 'PENDENTE' && currentUser.isAdmin && (
-                    <div className="flex items-center justify-end gap-2 pt-2 border-t border-amber-200">
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-end gap-2 pt-2 border-t border-amber-200">
                       <button
                         onClick={() => {
                           const res = approveNegativeStockRequest(req.id);
@@ -1038,7 +2265,7 @@ export const SettingsTab: React.FC = () => {
                             showNotice(res.message || 'Saída autorizada com sucesso!');
                           }
                         }}
-                        className="px-4 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
+                        className="px-4 py-2 sm:py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors text-center"
                       >
                         Autorizar Saída Excepcional
                       </button>
@@ -1047,7 +2274,7 @@ export const SettingsTab: React.FC = () => {
                           rejectNegativeStockRequest(req.id);
                           showNotice('Solicitação recusada.');
                         }}
-                        className="px-3.5 py-1.5 bg-zinc-200 hover:bg-zinc-300 text-zinc-700 rounded-lg text-xs font-semibold transition-colors"
+                        className="px-3.5 py-2 sm:py-1.5 bg-zinc-200 hover:bg-zinc-300 text-zinc-700 rounded-lg text-xs font-semibold transition-colors text-center"
                       >
                         Recusar Solicitação
                       </button>
@@ -1062,10 +2289,10 @@ export const SettingsTab: React.FC = () => {
 
       {/* SUB-TAB 4: CONFIGURAÇÃO DE FOTOS DOS PRODUTOS */}
       {activeSubTab === 'fotos' && (
-        <div className="bg-white p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
+        <div className="bg-white p-4 sm:p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
           <div className="border-b border-zinc-100 pb-3">
             <h2 className="text-base font-bold text-zinc-900 flex items-center gap-2">
-              <Eye className="w-5 h-5 text-red-600" />
+              <Eye className="w-5 h-5 text-red-600 shrink-0" />
               Recurso Opcional de Fotografias dos Produtos
             </h2>
             <p className="text-xs text-zinc-500 mt-1">
@@ -1073,7 +2300,7 @@ export const SettingsTab: React.FC = () => {
             </p>
           </div>
 
-          <div className="p-5 bg-zinc-50 border border-zinc-200 rounded-xl flex items-center justify-between gap-4">
+          <div className="p-4 sm:p-5 bg-zinc-50 border border-zinc-200 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div>
               <div className="flex items-center gap-2">
                 <span className="font-bold text-sm text-zinc-900">
@@ -1114,11 +2341,11 @@ export const SettingsTab: React.FC = () => {
       )}
 
       {/* SUB-TAB 5: DADOS INSTITUCIONAIS DA QHS ENGENHARIA */}
-      {activeSubTab === 'empresa' && (
-        <div className="bg-white p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
+      {activeSubTab === 'empresa' && isPrincipalAdminMode && (
+        <div className="bg-white p-4 sm:p-6 rounded-xl border border-zinc-200 shadow-xs space-y-6">
           <div className="border-b border-zinc-100 pb-3">
             <h2 className="text-base font-bold text-zinc-900 flex items-center gap-2">
-              <Building className="w-5 h-5 text-red-600" />
+              <Building className="w-5 h-5 text-red-600 shrink-0" />
               Identidade Institucional da Empresa
             </h2>
             <p className="text-xs text-zinc-500 mt-1">
@@ -1179,7 +2406,7 @@ export const SettingsTab: React.FC = () => {
           <div className="pt-2">
             <button
               onClick={() => showNotice('Dados da empresa salvos.')}
-              className="flex items-center gap-1.5 px-4 py-2 bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors"
+              className="w-full sm:w-auto flex items-center justify-center gap-1.5 px-4 py-2 bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors"
             >
               <Save className="w-4 h-4" />
               Salvar Alterações
@@ -1188,24 +2415,24 @@ export const SettingsTab: React.FC = () => {
         </div>
       )}
 
-      {/* Modal: Cadastrar ou Editar Colaborador */}
+      {/* Modal: Cadastrar ou Editar Usuário do Sistema */}
       {isAddUserModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
-          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full overflow-hidden border border-zinc-200">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-100 bg-zinc-900 text-white">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/70 backdrop-blur-xs">
+          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto border border-zinc-200">
+            <div className="sticky top-0 z-10 flex items-center justify-between px-4 sm:px-6 py-4 border-b border-zinc-100 bg-zinc-900 text-white">
               <h3 className="text-sm font-bold flex items-center gap-2">
-                <UserPlus className="w-4 h-4 text-red-500" />
-                {editingUser ? 'Editar Colaborador' : 'Cadastrar Novo Colaborador'}
+                <UserPlus className="w-4 h-4 text-red-500 shrink-0" />
+                {editingUser ? 'Editar Usuário do Sistema' : 'Cadastrar Usuário do Sistema'}
               </h3>
               <button
                 onClick={() => setIsAddUserModalOpen(false)}
-                className="text-zinc-400 hover:text-white"
+                className="text-zinc-400 hover:text-white p-1"
               >
                 ✕
               </button>
             </div>
 
-            <form onSubmit={handleSaveEmployee} className="p-6 space-y-4">
+            <form onSubmit={handleSaveEmployee} className="p-4 sm:p-6 space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-zinc-700 mb-1">
                   Nome Completo *
@@ -1234,16 +2461,26 @@ export const SettingsTab: React.FC = () => {
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-zinc-700 mb-1">
                     Cargo / Função *
                   </label>
                   <select
+                    required
                     value={userFormData.role}
                     onChange={(e) => setUserFormData({ ...userFormData, role: e.target.value })}
                     className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white"
                   >
+                    <option value="">
+                      {managedLists.roles.length === 0
+                        ? 'Cadastre um cargo na Lista de Cargos...'
+                        : 'Selecione um cargo...'}
+                    </option>
+                    {userFormData.role &&
+                      !managedLists.roles.includes(userFormData.role) && (
+                        <option value={userFormData.role}>{userFormData.role}</option>
+                      )}
                     {managedLists.roles.map((r) => (
                       <option key={r} value={r}>
                         {r}
@@ -1268,19 +2505,42 @@ export const SettingsTab: React.FC = () => {
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 pt-1">
-                <input
-                  type="checkbox"
-                  id="activeUserCheckbox"
-                  checked={userFormData.active}
-                  onChange={(e) =>
-                    setUserFormData({ ...userFormData, active: e.target.checked })
-                  }
-                  className="rounded text-red-600 focus:ring-red-600"
-                />
-                <label htmlFor="activeUserCheckbox" className="text-xs font-semibold text-zinc-800 cursor-pointer">
-                  Colaborador Ativo (Aparece na lista de retiradas e lançamentos)
-                </label>
+              <div className="space-y-2.5 pt-1">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="activeUserCheckbox"
+                    checked={userFormData.active}
+                    onChange={(e) =>
+                      setUserFormData({ ...userFormData, active: e.target.checked })
+                    }
+                    className="rounded text-red-600 focus:ring-red-600"
+                  />
+                  <label htmlFor="activeUserCheckbox" className="text-xs font-semibold text-zinc-800 cursor-pointer">
+                    Usuário Ativo (Autorizado a fazer login no aplicativo com este e-mail)
+                  </label>
+                </div>
+
+                <div className="flex items-start gap-2 p-2.5 rounded-lg bg-zinc-50 border border-zinc-200">
+                  <input
+                    type="checkbox"
+                    id="canDeleteUserCheckbox"
+                    checked={userFormData.isAdmin || userFormData.canDelete}
+                    disabled={userFormData.isAdmin}
+                    onChange={(e) =>
+                      setUserFormData({ ...userFormData, canDelete: e.target.checked })
+                    }
+                    className="rounded text-red-600 focus:ring-red-600 mt-0.5"
+                  />
+                  <label htmlFor="canDeleteUserCheckbox" className="text-xs text-zinc-800 cursor-pointer leading-snug">
+                    <span className="font-semibold block">
+                      Permitir exclusão direta de registros (sem aprovação)
+                    </span>
+                    <span className="text-[11px] text-zinc-500">
+                      Se desmarcado, este colaborador deverá enviar solicitação com justificativa para o Administrador aprovar.
+                    </span>
+                  </label>
+                </div>
               </div>
 
               {/* Permissões iniciais para este funcionário */}
@@ -1288,7 +2548,7 @@ export const SettingsTab: React.FC = () => {
                 <span className="block text-xs font-bold text-zinc-800 mb-2">
                   Abas que este funcionário poderá visualizar:
                 </span>
-                <div className="grid grid-cols-2 gap-2 bg-zinc-50 p-3 rounded-lg border border-zinc-200">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 bg-zinc-50 p-3 rounded-lg border border-zinc-200">
                   {TAB_CONFIGS.map((tab) => (
                     <label key={tab.id} className="flex items-center gap-2 text-xs text-zinc-700 cursor-pointer">
                       <input
@@ -1311,7 +2571,7 @@ export const SettingsTab: React.FC = () => {
                 </div>
               </div>
 
-              <div className="flex items-center justify-end gap-3 pt-3 border-t border-zinc-100">
+              <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3 pt-3 border-t border-zinc-100">
                 <button
                   type="button"
                   onClick={() => setIsAddUserModalOpen(false)}
@@ -1323,13 +2583,121 @@ export const SettingsTab: React.FC = () => {
                   type="submit"
                   className="px-5 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg shadow-xs"
                 >
-                  Salvar Colaborador
+                  Salvar Usuário
                 </button>
               </div>
             </form>
           </div>
         </div>
       )}
+
+      {/* Generic In-App Confirmation Modal */}
+      {confirmDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
+          <div className="bg-white rounded-xl shadow-2xl max-w-md w-full border border-zinc-200 overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-3.5 bg-zinc-900 text-white">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-red-500" />
+                <h3 className="text-sm font-bold">{confirmDialog.title}</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConfirmDialog(null)}
+                className="text-zinc-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <p className="text-xs text-zinc-700 leading-relaxed">{confirmDialog.message}</p>
+              <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-zinc-100">
+                <button
+                  type="button"
+                  onClick={() => setConfirmDialog(null)}
+                  className="px-4 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-100 rounded-lg"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const fn = confirmDialog.onConfirm;
+                    setConfirmDialog(null);
+                    fn();
+                  }}
+                  className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg shadow-xs"
+                >
+                  Confirmar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <DeletionActionModal
+        target={deletionTarget}
+        canDeleteDirectly={canDeleteDirectly}
+        hasPendingRequest={deletionTarget ? pendingTargetIds.has(deletionTarget.targetId) : false}
+        isSubmitting={isSubmittingDeletion}
+        onClose={() => {
+          if (!isSubmittingDeletion) setDeletionTarget(null);
+        }}
+        onConfirmDirectDelete={async () => {
+          if (!deletionTarget) return;
+          setIsSubmittingDeletion(true);
+          try {
+            const res =
+              deletionTarget.recordType === 'COLABORADOR'
+                ? await deleteCollaborator(deletionTarget.targetId)
+                : await deleteNegativeStockRequest(deletionTarget.targetId);
+            setDeletionTarget(null);
+            if (res.success) {
+              showNotice(
+                res.message ||
+                  (deletionTarget.recordType === 'COLABORADOR'
+                    ? 'Colaborador excluído do cadastro.'
+                    : 'Solicitação excluída do sistema.')
+              );
+            } else {
+              showNotice(
+                res.message ||
+                  (deletionTarget.recordType === 'COLABORADOR'
+                    ? 'Não foi possível excluir o colaborador.'
+                    : 'Não foi possível excluir a solicitação.'),
+                true
+              );
+            }
+          } finally {
+            setIsSubmittingDeletion(false);
+          }
+        }}
+        onSubmitRequest={async (reason) => {
+          if (!deletionTarget) return;
+          setIsSubmittingDeletion(true);
+          try {
+            const res = await createDeletionRequest({
+              recordType: deletionTarget.recordType,
+              targetId: deletionTarget.targetId,
+              targetCode: deletionTarget.targetCode,
+              targetName: deletionTarget.targetName,
+              targetDetails: deletionTarget.targetDetails,
+              quantity: deletionTarget.quantity,
+              reason,
+            });
+            setDeletionTarget(null);
+            showNotice(
+              res.message ||
+                (res.success
+                  ? 'Solicitação de exclusão enviada ao Administrador.'
+                  : 'Não foi possível enviar a solicitação.'),
+              !res.success
+            );
+          } finally {
+            setIsSubmittingDeletion(false);
+          }
+        }}
+      />
     </div>
   );
 };

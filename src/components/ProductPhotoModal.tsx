@@ -19,7 +19,7 @@ export const ProductPhotoModal: React.FC = () => {
       aria-modal="true"
     >
       <div
-        className="bg-white rounded-xl shadow-2xl max-w-2xl w-full overflow-hidden border border-zinc-200"
+        className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto border border-zinc-200"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
