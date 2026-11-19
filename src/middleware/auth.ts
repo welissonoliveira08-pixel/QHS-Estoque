@@ -1,7 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
 import type { DecodedIdToken } from 'firebase-admin/auth';
 import { adminAuth } from '../lib/firebase-admin.ts';
-import { resolveAuthenticatedUser } from '../db/repository.ts';
 import type { User } from '../types/index.ts';
 
 export interface AuthRequest extends Request {
@@ -10,63 +9,78 @@ export interface AuthRequest extends Request {
   isRealAdmin?: boolean;
 }
 
-export const requireAuth = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Não autenticado: token ausente.' });
-    return;
-  }
+export type ResolveAuthenticatedUserFn = (params: {
+  uid: string;
+  email: string;
+  displayName?: string;
+}) => Promise<{ authorized: boolean; isRealAdmin: boolean; user?: User; errorMessage?: string }>;
 
-  const token = authHeader.slice('Bearer '.length).trim();
-  if (!token) {
-    res.status(401).json({ error: 'Não autenticado: token inválido.' });
-    return;
-  }
+export function createRequireAuth(resolveUser: ResolveAuthenticatedUserFn) {
+  return async (req: AuthRequest, res: Response, next: NextFunction) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Não autenticado: token ausente.' });
+      return;
+    }
 
-  let decodedToken: DecodedIdToken;
-  try {
-    decodedToken = await adminAuth.verifyIdToken(token);
-  } catch (error) {
-    console.error('Error verifying Firebase ID token:', error);
-    res.status(401).json({ error: 'Sessão inválida ou expirada. Faça login novamente.' });
-    return;
-  }
+    const token = authHeader.slice('Bearer '.length).trim();
+    if (!token) {
+      res.status(401).json({ error: 'Não autenticado: token inválido.' });
+      return;
+    }
 
-  if (!decodedToken.email || decodedToken.email_verified !== true) {
-    res.status(403).json({
-      error:
-        'Acesso negado: confirme o link de verificação enviado para o seu e-mail antes de acessar o sistema.',
-    });
-    return;
-  }
+    let decodedToken: DecodedIdToken;
+    try {
+      decodedToken = await adminAuth.verifyIdToken(token);
+    } catch (error) {
+      console.error('Error verifying Firebase ID token:', error);
+      res.status(401).json({ error: 'Sessão inválida ou expirada. Faça login novamente.' });
+      return;
+    }
 
-  try {
-    const authResult = await resolveAuthenticatedUser({
-      uid: decodedToken.uid,
-      email: decodedToken.email,
-      displayName: decodedToken.name,
-    });
-
-    if (!authResult.authorized || !authResult.user) {
+    if (!decodedToken.email || decodedToken.email_verified !== true) {
       res.status(403).json({
-        error: authResult.errorMessage || 'Acesso não autorizado.',
+        error:
+          'Acesso negado: confirme o link de verificação enviado para o seu e-mail antes de acessar o sistema.',
       });
       return;
     }
 
-    req.user = decodedToken;
-    req.dbUser = authResult.user;
-    req.isRealAdmin = authResult.isRealAdmin;
-    next();
-  } catch (error) {
-    console.error('Auth database verification error:', error);
-    res.status(500).json({ error: 'Erro interno ao validar acesso no banco de dados.' });
-  }
-};
+    try {
+      const authResult = await resolveUser({
+        uid: decodedToken.uid,
+        email: decodedToken.email,
+        displayName: decodedToken.name,
+      });
+
+      if (!authResult.authorized || !authResult.user) {
+        res.status(403).json({
+          error: authResult.errorMessage || 'Acesso não autorizado.',
+        });
+        return;
+      }
+
+      req.user = decodedToken;
+      req.dbUser = authResult.user;
+      req.isRealAdmin = authResult.isRealAdmin;
+      next();
+    } catch (error) {
+      console.error('Auth database verification error:', error);
+      const statusCode =
+        typeof error === 'object' &&
+        error !== null &&
+        'statusCode' in error &&
+        typeof (error as { statusCode?: unknown }).statusCode === 'number'
+          ? (error as { statusCode: number }).statusCode
+          : 500;
+      const message =
+        error instanceof Error && error.message
+          ? error.message
+          : 'Erro interno ao validar acesso no banco de dados.';
+      res.status(statusCode).json({ error: message });
+    }
+  };
+}
 
 export const requireAdmin = (
   req: AuthRequest,
