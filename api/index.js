@@ -1,105 +1,90 @@
 // @ts-nocheck
 
-// src/server/app.ts
-import express from "express";
-
-// src/lib/firebase-admin.ts
-import fs from "node:fs";
-import path from "node:path";
-import { initializeApp, getApps } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
-function resolveFirebaseProjectId() {
-  if (process.env.FIREBASE_PROJECT_ID) {
-    return process.env.FIREBASE_PROJECT_ID;
-  }
-  try {
-    const configPath = path.resolve(process.cwd(), "firebase-applet-config.json");
-    if (fs.existsSync(configPath)) {
-      const parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
-      if (typeof parsed.projectId === "string" && parsed.projectId.trim()) {
-        return parsed.projectId.trim();
-      }
-    }
-  } catch {
-  }
-  return "sylvan-throne-pbcxw";
+// src/lib/verifyFirebaseJwt.ts
+import crypto from "node:crypto";
+var GOOGLE_CERTS_URL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com";
+var FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "sylvan-throne-pbcxw";
+var cachedCerts = null;
+var cachedCertsExpiresAt = 0;
+function parseMaxAgeSeconds(cacheControl) {
+  if (!cacheControl) return 3600;
+  const match = cacheControl.match(/max-age=(\d+)/i);
+  if (!match) return 3600;
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) && seconds > 60 ? seconds : 3600;
 }
-if (!getApps().length) {
-  initializeApp({
-    projectId: resolveFirebaseProjectId()
+async function getGooglePublicCerts(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedCerts && now < cachedCertsExpiresAt) {
+    return cachedCerts;
+  }
+  const response = await fetch(GOOGLE_CERTS_URL, {
+    method: "GET",
+    signal: AbortSignal.timeout(8e3)
   });
+  if (!response.ok) {
+    throw new Error(`Falha ao obter certificados p\xFAblicos do Firebase (${response.status}).`);
+  }
+  const certs = await response.json();
+  const maxAge = parseMaxAgeSeconds(response.headers.get("cache-control"));
+  cachedCerts = certs;
+  cachedCertsExpiresAt = now + maxAge * 1e3;
+  return certs;
 }
-var adminAuth = getAuth();
-
-// src/middleware/auth.ts
-function createRequireAuth(resolveUser) {
-  return async (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      res.status(401).json({ error: "N\xE3o autenticado: token ausente." });
-      return;
-    }
-    const token = authHeader.slice("Bearer ".length).trim();
-    if (!token) {
-      res.status(401).json({ error: "N\xE3o autenticado: token inv\xE1lido." });
-      return;
-    }
-    let decodedToken;
-    try {
-      decodedToken = await adminAuth.verifyIdToken(token);
-    } catch (error) {
-      console.error("Error verifying Firebase ID token:", error);
-      res.status(401).json({ error: "Sess\xE3o inv\xE1lida ou expirada. Fa\xE7a login novamente." });
-      return;
-    }
-    if (!decodedToken.email || decodedToken.email_verified !== true) {
-      res.status(403).json({
-        error: "Acesso negado: confirme o link de verifica\xE7\xE3o enviado para o seu e-mail antes de acessar o sistema."
-      });
-      return;
-    }
-    try {
-      const authResult = await resolveUser({
-        uid: decodedToken.uid,
-        email: decodedToken.email,
-        displayName: decodedToken.name
-      });
-      if (!authResult.authorized || !authResult.user) {
-        res.status(403).json({
-          error: authResult.errorMessage || "Acesso n\xE3o autorizado."
-        });
-        return;
-      }
-      req.user = decodedToken;
-      req.dbUser = authResult.user;
-      req.isRealAdmin = authResult.isRealAdmin;
-      next();
-    } catch (error) {
-      console.error("Auth database verification error:", error);
-      const statusCode = typeof error === "object" && error !== null && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : 500;
-      const message = error instanceof Error && error.message ? error.message : "Erro interno ao validar acesso no banco de dados.";
-      res.status(statusCode).json({ error: message });
-    }
+function decodeBase64UrlJson(segment) {
+  const json = Buffer.from(segment, "base64url").toString("utf8");
+  return JSON.parse(json);
+}
+async function verifyFirebaseIdToken(token) {
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new Error("Token JWT inv\xE1lido.");
+  }
+  const [headerSeg, payloadSeg, sigSeg] = parts;
+  const header = decodeBase64UrlJson(headerSeg);
+  if (header.alg !== "RS256" || !header.kid) {
+    throw new Error("Cabe\xE7alho do token Firebase inv\xE1lido.");
+  }
+  let certs = await getGooglePublicCerts(false);
+  let certPem = certs[header.kid];
+  if (!certPem) {
+    certs = await getGooglePublicCerts(true);
+    certPem = certs[header.kid];
+  }
+  if (!certPem) {
+    throw new Error("Certificado de assinatura do token n\xE3o encontrado.");
+  }
+  const verifier = crypto.createVerify("RSA-SHA256");
+  verifier.update(`${headerSeg}.${payloadSeg}`);
+  verifier.end();
+  const signatureValid = verifier.verify(certPem, Buffer.from(sigSeg, "base64url"));
+  if (!signatureValid) {
+    throw new Error("Assinatura do token Firebase inv\xE1lida.");
+  }
+  const payload = decodeBase64UrlJson(payloadSeg);
+  const nowSec = Math.floor(Date.now() / 1e3);
+  if (payload.aud !== FIREBASE_PROJECT_ID) {
+    throw new Error("Token Firebase emitido para outro projeto.");
+  }
+  if (payload.iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) {
+    throw new Error("Emissor do token Firebase inv\xE1lido.");
+  }
+  if (!payload.sub || typeof payload.sub !== "string" || payload.sub.length > 128) {
+    throw new Error("Identificador de usu\xE1rio inv\xE1lido no token.");
+  }
+  if (typeof payload.exp !== "number" || payload.exp <= nowSec - 30) {
+    throw new Error("Token Firebase expirado.");
+  }
+  if (typeof payload.iat !== "number" || payload.iat > nowSec + 300) {
+    throw new Error("Data de emiss\xE3o do token Firebase inv\xE1lida.");
+  }
+  return {
+    uid: payload.sub,
+    email: typeof payload.email === "string" ? payload.email : void 0,
+    email_verified: Boolean(payload.email_verified),
+    name: typeof payload.name === "string" ? payload.name : void 0
   };
 }
-var requireAdmin = (req, res, next) => {
-  if (!req.isRealAdmin || !req.dbUser?.isAdmin) {
-    res.status(403).json({
-      error: "Acesso restrito ao Administrador principal."
-    });
-    return;
-  }
-  next();
-};
-var requireDirectDelete = (req, res, next) => {
-  if (!req.dbUser || !req.dbUser.isAdmin && !req.dbUser.canDelete) {
-    res.status(403).json({
-      error: 'Voc\xEA n\xE3o possui permiss\xE3o para excluir registros diretamente. Utilize a op\xE7\xE3o "Solicitar exclus\xE3o".'
-    });
-    return;
-  }
-  next();
-};
 
 // src/db/shared.ts
 var ORG_ID = "qhs-engenharia";
@@ -110,11 +95,6 @@ var DomainError = class extends Error {
     this.statusCode = statusCode;
   }
 };
-function isSqlDatabaseConfigured() {
-  return Boolean(
-    process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME
-  );
-}
 function formatDateToday() {
   const now = /* @__PURE__ */ new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
@@ -145,434 +125,6 @@ var FULL_ADMIN_PERMISSIONS = {
   estatisticas: true,
   configuracoes: true
 };
-
-// src/server/app.ts
-var asyncHandler = (fn) => (req, res, next) => {
-  Promise.resolve(fn(req, res, next)).catch(next);
-};
-function createApiApp(repo) {
-  const app = express();
-  const requireAuth = createRequireAuth(repo.resolveAuthenticatedUser);
-  app.use(express.json({ limit: "5mb" }));
-  app.get("/api/health", (_req, res) => {
-    const hasSupabaseUrl = Boolean(
-      process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.VITE_SUPABASE_URL
-    );
-    const hasSupabaseKey = Boolean(
-      process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY
-    );
-    res.json({
-      ok: true,
-      mode: isSqlDatabaseConfigured() ? "cloudsql" : "supabase",
-      supabaseConfigured: hasSupabaseUrl && hasSupabaseKey
-    });
-  });
-  app.post(
-    "/api/auth/verify-invite",
-    asyncHandler(async (req, res) => {
-      const email = String(req.body?.email ?? "").trim();
-      const status = await repo.checkEmailInvitationStatus(email);
-      if (!status.authorized) {
-        res.status(403).json({ error: status.message || "E-mail n\xE3o autorizado." });
-        return;
-      }
-      res.json(status);
-    })
-  );
-  app.post(
-    "/api/auth/request-access",
-    asyncHandler(async (req, res) => {
-      const result = await repo.createAccessRequestInDb({
-        name: String(req.body?.name ?? ""),
-        email: String(req.body?.email ?? ""),
-        role: req.body?.role ? String(req.body.role) : "",
-        department: req.body?.department ? String(req.body.department) : "",
-        reason: req.body?.reason ? String(req.body.reason) : ""
-      });
-      res.status(result.alreadyAuthorized ? 200 : 201).json(result);
-    })
-  );
-  app.get(
-    "/api/bootstrap",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const data = await repo.getBootstrapData(req.dbUser, req.user.uid);
-      res.json(data);
-    })
-  );
-  app.patch(
-    "/api/settings/photos",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const showProductPhotos = Boolean(req.body?.showProductPhotos);
-      await repo.updateSystemSettingsInDb({ showProductPhotos });
-      res.json({ ok: true, showProductPhotos });
-    })
-  );
-  app.put(
-    "/api/settings",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      await repo.updateSystemSettingsInDb(req.body ?? {});
-      res.json({ ok: true });
-    })
-  );
-  app.put(
-    "/api/lists",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const { lists, renameGroup, renameRole } = req.body ?? {};
-      if (!lists || !Array.isArray(lists.groups) || !Array.isArray(lists.roles) || !Array.isArray(lists.destinations)) {
-        throw new DomainError("Dados de listas inv\xE1lidos.", 400);
-      }
-      await repo.updateManagedListsInDb({ lists, renameGroup, renameRole });
-      res.json({ ok: true });
-    })
-  );
-  app.post(
-    "/api/users",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const created = await repo.createUserInDb(req.body ?? {});
-      res.status(201).json(created);
-    })
-  );
-  app.put(
-    "/api/users/:id",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const updated = await repo.updateUserInDb({ ...req.body ?? {}, id });
-      res.json(updated);
-    })
-  );
-  app.patch(
-    "/api/users/:id/permissions",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      await repo.updateUserPermissionsInDb(id, req.body?.permissions ?? {});
-      res.json({ ok: true });
-    })
-  );
-  app.patch(
-    "/api/users/:id/delete-permission",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      await repo.updateUserDeletePermissionInDb(id, Boolean(req.body?.canDelete));
-      res.json({ ok: true });
-    })
-  );
-  app.delete(
-    "/api/users/:id",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      await repo.deleteUserInDb(id);
-      res.json({ ok: true });
-    })
-  );
-  app.post(
-    "/api/access-requests/:id/approve",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const result = await repo.approveAccessRequestInDb({
-        requestId: id,
-        admin: req.dbUser,
-        role: req.body?.role ? String(req.body.role) : void 0,
-        department: req.body?.department ? String(req.body.department) : void 0,
-        canDelete: req.body?.canDelete !== void 0 ? Boolean(req.body.canDelete) : void 0,
-        permissions: req.body?.permissions
-      });
-      res.json({ ok: true, ...result });
-    })
-  );
-  app.post(
-    "/api/access-requests/:id/reject",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const updated = await repo.rejectAccessRequestInDb({
-        requestId: id,
-        admin: req.dbUser
-      });
-      res.json({ ok: true, request: updated });
-    })
-  );
-  app.post(
-    "/api/collaborators",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const created = await repo.createCollaboratorInDb({
-        ownerUid: req.user.uid,
-        fullName: String(req.body?.fullName ?? ""),
-        role: req.body?.role ? String(req.body.role) : "",
-        active: req.body?.active !== void 0 ? Boolean(req.body.active) : true
-      });
-      res.status(201).json(created);
-    })
-  );
-  app.put(
-    "/api/collaborators/:id",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const updated = await repo.updateCollaboratorInDb({
-        id,
-        fullName: String(req.body?.fullName ?? ""),
-        role: req.body?.role ? String(req.body.role) : "",
-        active: Boolean(req.body?.active)
-      });
-      res.json(updated);
-    })
-  );
-  app.patch(
-    "/api/collaborators/:id/toggle",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const updated = await repo.toggleCollaboratorActiveInDb(id);
-      res.json(updated);
-    })
-  );
-  app.delete(
-    "/api/collaborators/:id",
-    requireAuth,
-    requireDirectDelete,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const deletedName = await repo.deleteCollaboratorInDb({
-        collaboratorId: id,
-        actor: req.dbUser,
-        actorEmail: req.user.email || req.dbUser.email,
-        actorUid: req.user.uid
-      });
-      res.json({ ok: true, deletedName });
-    })
-  );
-  app.post(
-    "/api/products",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const created = await repo.createProductInDb(req.user.uid, req.body ?? {});
-      res.status(201).json(created);
-    })
-  );
-  app.put(
-    "/api/products/:id",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const updated = await repo.updateProductInDb({ ...req.body ?? {}, id });
-      res.json(updated);
-    })
-  );
-  app.delete(
-    "/api/products/:id",
-    requireAuth,
-    requireDirectDelete,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const deletedName = await repo.deleteProductInDb({
-        productId: id,
-        actor: req.dbUser,
-        actorEmail: req.user.email || req.dbUser.email,
-        actorUid: req.user.uid
-      });
-      res.json({ ok: true, deletedName });
-    })
-  );
-  app.post(
-    "/api/movements",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const result = await repo.recordMovementInDb({
-        id: req.body?.id,
-        productId: String(req.body?.productId ?? ""),
-        type: req.body?.type === "ENTRADA" ? "ENTRADA" : "SAIDA",
-        quantity: Number(req.body?.quantity ?? 0),
-        date: req.body?.date ? String(req.body.date) : void 0,
-        withdrawnBy: req.body?.withdrawnBy ? String(req.body.withdrawnBy) : void 0,
-        collaboratorId: req.body?.collaboratorId ? String(req.body.collaboratorId) : void 0,
-        destination: req.body?.destination ? String(req.body.destination) : void 0,
-        notes: req.body?.notes ? String(req.body.notes) : void 0,
-        isNegativeStockAuthorized: req.body?.isNegativeStockAuthorized !== void 0 ? Boolean(req.body.isNegativeStockAuthorized) : void 0,
-        authorizedBy: req.body?.authorizedBy ? String(req.body.authorizedBy) : void 0,
-        actor: req.dbUser,
-        actorUid: req.user.uid
-      });
-      res.status(201).json(result);
-    })
-  );
-  app.delete(
-    "/api/movements/:id",
-    requireAuth,
-    requireDirectDelete,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const result = await repo.deleteMovementInDb({
-        movementId: id,
-        actor: req.dbUser,
-        actorEmail: req.user.email || req.dbUser.email,
-        actorUid: req.user.uid
-      });
-      res.json({ ok: true, ...result });
-    })
-  );
-  app.post(
-    "/api/negative-requests",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const result = await repo.createNegativeRequestInDb({
-        id: req.body?.id,
-        productId: String(req.body?.productId ?? ""),
-        requestedQuantity: Number(req.body?.requestedQuantity ?? 0),
-        withdrawnBy: String(req.body?.withdrawnBy ?? ""),
-        collaboratorId: req.body?.collaboratorId ? String(req.body.collaboratorId) : void 0,
-        destination: String(req.body?.destination ?? ""),
-        reason: String(req.body?.reason ?? ""),
-        actor: req.dbUser,
-        actorUid: req.user.uid
-      });
-      res.status(201).json(result);
-    })
-  );
-  app.post(
-    "/api/negative-requests/:id/approve",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const result = await repo.approveNegativeRequestInDb({
-        requestId: id,
-        admin: req.dbUser,
-        adminUid: req.user.uid
-      });
-      res.json({ ok: true, ...result });
-    })
-  );
-  app.post(
-    "/api/negative-requests/:id/reject",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      await repo.rejectNegativeRequestInDb(id, req.dbUser.name);
-      res.json({ ok: true });
-    })
-  );
-  app.delete(
-    "/api/negative-requests/:id",
-    requireAuth,
-    requireDirectDelete,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      await repo.deleteNegativeRequestInDb({
-        requestId: id,
-        actor: req.dbUser,
-        actorEmail: req.user.email || req.dbUser.email,
-        actorUid: req.user.uid
-      });
-      res.json({ ok: true });
-    })
-  );
-  app.post(
-    "/api/deletion-requests",
-    requireAuth,
-    asyncHandler(async (req, res) => {
-      const result = await repo.createDeletionRequestInDb({
-        recordType: req.body?.recordType,
-        targetId: String(req.body?.targetId ?? ""),
-        targetCode: String(req.body?.targetCode ?? ""),
-        targetName: String(req.body?.targetName ?? ""),
-        targetDetails: String(req.body?.targetDetails ?? ""),
-        quantity: Number(req.body?.quantity ?? 0),
-        reason: String(req.body?.reason ?? ""),
-        actor: req.dbUser,
-        actorEmail: req.user.email || req.dbUser.email,
-        actorUid: req.user.uid
-      });
-      res.status(201).json(result);
-    })
-  );
-  app.post(
-    "/api/deletion-requests/:id/approve",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const result = await repo.approveDeletionRequestInDb({
-        requestId: id,
-        admin: req.dbUser,
-        adminEmail: req.user.email || req.dbUser.email,
-        adminUid: req.user.uid
-      });
-      res.json({ ok: true, ...result });
-    })
-  );
-  app.post(
-    "/api/deletion-requests/:id/reject",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      const id = String(req.params.id);
-      const result = await repo.rejectDeletionRequestInDb({
-        requestId: id,
-        admin: req.dbUser,
-        adminEmail: req.user.email || req.dbUser.email
-      });
-      res.json({ ok: true, ...result });
-    })
-  );
-  app.post(
-    "/api/admin/supabase-sync",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (_req, res) => {
-      if (repo.forceSupabaseSync) {
-        await repo.forceSupabaseSync();
-      }
-      res.json({ ok: true });
-    })
-  );
-  app.post(
-    "/api/admin/reset",
-    requireAuth,
-    requireAdmin,
-    asyncHandler(async (req, res) => {
-      await repo.resetAllDataInDb(
-        req.user.uid,
-        req.user.email || req.dbUser.email,
-        req.dbUser.name
-      );
-      res.json({ ok: true });
-    })
-  );
-  app.all("/api/*", (_req, res) => {
-    res.status(404).json({ error: "Rota de API n\xE3o encontrada." });
-  });
-  app.use("/api", (err, _req, res, _next) => {
-    if (err instanceof DomainError) {
-      res.status(err.statusCode).json({ error: err.message });
-      return;
-    }
-    console.error("Unhandled API error:", err);
-    const message = err instanceof Error && err.message ? err.message : "Erro interno ao processar opera\xE7\xE3o no servidor.";
-    res.status(500).json({ error: message });
-  });
-  return app;
-}
 
 // src/data/initialData.ts
 var INITIAL_SETTINGS = {
@@ -2080,68 +1632,462 @@ async function resetAllDataSupabase(adminUid, adminEmail, adminName) {
 }
 
 // src/server/vercelEntry.ts
-var cachedApp = null;
-function getApp() {
-  if (!cachedApp) {
-    cachedApp = createApiApp({
-      checkEmailInvitationStatus: checkEmailInvitationStatusSupabase,
-      resolveAuthenticatedUser: resolveAuthenticatedUserSupabase,
-      getBootstrapData: getBootstrapDataSupabase,
-      updateSystemSettingsInDb: updateSystemSettingsSupabase,
-      updateManagedListsInDb: updateManagedListsSupabase,
-      createUserInDb: createUserSupabase,
-      updateUserInDb: updateUserSupabase,
-      updateUserPermissionsInDb: updateUserPermissionsSupabase,
-      updateUserDeletePermissionInDb: updateUserDeletePermissionSupabase,
-      deleteUserInDb: deleteUserSupabase,
-      createAccessRequestInDb: createAccessRequestSupabase,
-      approveAccessRequestInDb: approveAccessRequestSupabase,
-      rejectAccessRequestInDb: rejectAccessRequestSupabase,
-      createCollaboratorInDb: createCollaboratorSupabase,
-      updateCollaboratorInDb: updateCollaboratorSupabase,
-      toggleCollaboratorActiveInDb: toggleCollaboratorActiveSupabase,
-      deleteCollaboratorInDb: deleteCollaboratorSupabase,
-      createProductInDb: createProductSupabase,
-      updateProductInDb: updateProductSupabase,
-      deleteProductInDb: deleteProductSupabase,
-      recordMovementInDb: recordMovementSupabase,
-      deleteMovementInDb: deleteMovementSupabase,
-      createNegativeRequestInDb: createNegativeRequestSupabase,
-      approveNegativeRequestInDb: approveNegativeRequestSupabase,
-      rejectNegativeRequestInDb: rejectNegativeRequestSupabase,
-      deleteNegativeRequestInDb: deleteNegativeRequestSupabase,
-      createDeletionRequestInDb: createDeletionRequestSupabase,
-      approveDeletionRequestInDb: approveDeletionRequestSupabase,
-      rejectDeletionRequestInDb: rejectDeletionRequestSupabase,
-      resetAllDataInDb: resetAllDataSupabase
-    });
-  }
-  return cachedApp;
+function sendJson(res, statusCode, data) {
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(data));
 }
-function handler(req, res) {
-  try {
-    const rawUrl = req.url || "/";
-    if (rawUrl.startsWith("/api/index")) {
-      const parsed = new URL(rawUrl, "http://localhost");
-      const pathParam = parsed.searchParams.get("__path") || "";
-      parsed.searchParams.delete("__path");
-      const remainingQuery = parsed.searchParams.toString();
-      req.url = `/api/${pathParam.replace(/^\/+/, "")}${remainingQuery ? `?${remainingQuery}` : ""}`;
+async function readJsonBody(req) {
+  const existingBody = req.body;
+  if (existingBody && typeof existingBody === "object" && !Buffer.isBuffer(existingBody)) {
+    return existingBody;
+  }
+  if (typeof existingBody === "string") {
+    return existingBody.trim() ? JSON.parse(existingBody) : {};
+  }
+  const chunks = [];
+  let totalBytes = 0;
+  const maxBytes = 5 * 1024 * 1024;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buf.length;
+    if (totalBytes > maxBytes) {
+      throw new DomainError("Tamanho m\xE1ximo da requisi\xE7\xE3o excedido (5 MB).", 413);
     }
-    const app = getApp();
-    return app(
-      req,
-      res
-    );
+    chunks.push(buf);
+  }
+  if (chunks.length === 0) return {};
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) return {};
+  return JSON.parse(raw);
+}
+function resolveApiPath(rawUrl) {
+  const parsed = new URL(rawUrl || "/", "http://localhost");
+  if (parsed.pathname === "/api/index" && parsed.searchParams.has("__path")) {
+    const p = parsed.searchParams.get("__path") || "";
+    return `/api/${p.replace(/^\/+/, "")}`;
+  }
+  return parsed.pathname;
+}
+async function authenticateRequest(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    throw new DomainError("N\xE3o autenticado: token ausente.", 401);
+  }
+  const tokenStr = authHeader.slice("Bearer ".length).trim();
+  if (!tokenStr) {
+    throw new DomainError("N\xE3o autenticado: token inv\xE1lido.", 401);
+  }
+  let decoded;
+  try {
+    decoded = await verifyFirebaseIdToken(tokenStr);
   } catch (err) {
-    console.error("Vercel API handler error:", err);
-    res.statusCode = 500;
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.end(
-      JSON.stringify({
-        error: err instanceof Error ? err.message : "Erro interno ao inicializar servidor da API."
-      })
+    console.error("Firebase token verification error:", err);
+    throw new DomainError("Sess\xE3o inv\xE1lida ou expirada. Fa\xE7a login novamente.", 401);
+  }
+  if (!decoded.email || decoded.email_verified !== true) {
+    throw new DomainError(
+      "Acesso negado: confirme o link de verifica\xE7\xE3o enviado para o seu e-mail antes de acessar o sistema.",
+      403
     );
+  }
+  const authResult = await resolveAuthenticatedUserSupabase({
+    uid: decoded.uid,
+    email: decoded.email,
+    displayName: decoded.name
+  });
+  if (!authResult.authorized || !authResult.user) {
+    throw new DomainError(authResult.errorMessage || "Acesso n\xE3o autorizado.", 403);
+  }
+  return {
+    token: decoded,
+    dbUser: authResult.user,
+    isRealAdmin: authResult.isRealAdmin
+  };
+}
+function assertAdmin(session) {
+  if (!session.isRealAdmin || !session.dbUser.isAdmin) {
+    throw new DomainError("Acesso restrito ao Administrador principal.", 403);
+  }
+}
+function assertDirectDelete(session) {
+  if (!session.dbUser.isAdmin && !session.dbUser.canDelete) {
+    throw new DomainError(
+      'Voc\xEA n\xE3o possui permiss\xE3o para excluir registros diretamente. Utilize a op\xE7\xE3o "Solicitar exclus\xE3o".',
+      403
+    );
+  }
+}
+function matchPath(pathname, pattern) {
+  const pathParts = pathname.replace(/\/+$/, "").split("/");
+  const patternParts = pattern.replace(/\/+$/, "").split("/");
+  if (pathParts.length !== patternParts.length) return null;
+  const params = {};
+  for (let i = 0; i < patternParts.length; i += 1) {
+    const pat = patternParts[i];
+    const actual = pathParts[i];
+    if (pat.startsWith(":")) {
+      params[pat.slice(1)] = decodeURIComponent(actual);
+    } else if (pat !== actual) {
+      return null;
+    }
+  }
+  return params;
+}
+async function handler(req, res) {
+  try {
+    const method = (req.method || "GET").toUpperCase();
+    const pathname = resolveApiPath(req.url || "/");
+    if (method === "GET" && pathname === "/api/health") {
+      const hasSupabaseUrl = Boolean(
+        process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.VITE_SUPABASE_URL
+      );
+      const hasSupabaseKey = Boolean(
+        process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY
+      );
+      sendJson(res, 200, {
+        ok: true,
+        mode: "supabase",
+        supabaseConfigured: hasSupabaseUrl && hasSupabaseKey
+      });
+      return;
+    }
+    if (method === "POST" && pathname === "/api/auth/verify-invite") {
+      const body = await readJsonBody(req);
+      const email = String(body.email ?? "").trim();
+      const status = await checkEmailInvitationStatusSupabase(email);
+      if (!status.authorized) {
+        sendJson(res, 403, { error: status.message || "E-mail n\xE3o autorizado." });
+        return;
+      }
+      sendJson(res, 200, status);
+      return;
+    }
+    if (method === "POST" && pathname === "/api/auth/request-access") {
+      const body = await readJsonBody(req);
+      const result = await createAccessRequestSupabase({
+        name: String(body.name ?? ""),
+        email: String(body.email ?? ""),
+        role: body.role ? String(body.role) : "",
+        department: body.department ? String(body.department) : "",
+        reason: body.reason ? String(body.reason) : ""
+      });
+      sendJson(res, result.alreadyAuthorized ? 200 : 201, result);
+      return;
+    }
+    const session = await authenticateRequest(req);
+    if (method === "GET" && pathname === "/api/bootstrap") {
+      const data = await getBootstrapDataSupabase(session.dbUser, session.token.uid);
+      sendJson(res, 200, data);
+      return;
+    }
+    if (method === "PATCH" && pathname === "/api/settings/photos") {
+      const body = await readJsonBody(req);
+      const showProductPhotos = Boolean(body.showProductPhotos);
+      await updateSystemSettingsSupabase({ showProductPhotos });
+      sendJson(res, 200, { ok: true, showProductPhotos });
+      return;
+    }
+    if (method === "PUT" && pathname === "/api/settings") {
+      assertAdmin(session);
+      const body = await readJsonBody(req);
+      await updateSystemSettingsSupabase(body);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (method === "PUT" && pathname === "/api/lists") {
+      assertAdmin(session);
+      const body = await readJsonBody(req);
+      const lists = body.lists;
+      if (!lists || !Array.isArray(lists.groups) || !Array.isArray(lists.roles) || !Array.isArray(lists.destinations)) {
+        throw new DomainError("Dados de listas inv\xE1lidos.", 400);
+      }
+      await updateManagedListsSupabase({
+        lists,
+        renameGroup: body.renameGroup,
+        renameRole: body.renameRole
+      });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (method === "POST" && pathname === "/api/users") {
+      assertAdmin(session);
+      const body = await readJsonBody(req);
+      const created = await createUserSupabase(body);
+      sendJson(res, 201, created);
+      return;
+    }
+    let params = matchPath(pathname, "/api/users/:id");
+    if (params && method === "PUT") {
+      assertAdmin(session);
+      const body = await readJsonBody(req);
+      const updated = await updateUserSupabase({ ...body, id: params.id });
+      sendJson(res, 200, updated);
+      return;
+    }
+    if (params && method === "DELETE") {
+      assertAdmin(session);
+      await deleteUserSupabase(params.id);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    params = matchPath(pathname, "/api/users/:id/permissions");
+    if (params && method === "PATCH") {
+      assertAdmin(session);
+      const body = await readJsonBody(req);
+      await updateUserPermissionsSupabase(
+        params.id,
+        body.permissions ?? {}
+      );
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    params = matchPath(pathname, "/api/users/:id/delete-permission");
+    if (params && method === "PATCH") {
+      assertAdmin(session);
+      const body = await readJsonBody(req);
+      await updateUserDeletePermissionSupabase(params.id, Boolean(body.canDelete));
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    params = matchPath(pathname, "/api/access-requests/:id/approve");
+    if (params && method === "POST") {
+      assertAdmin(session);
+      const body = await readJsonBody(req);
+      const result = await approveAccessRequestSupabase({
+        requestId: params.id,
+        admin: session.dbUser,
+        role: body.role ? String(body.role) : void 0,
+        department: body.department ? String(body.department) : void 0,
+        canDelete: body.canDelete !== void 0 ? Boolean(body.canDelete) : void 0,
+        permissions: body.permissions
+      });
+      sendJson(res, 200, { ok: true, ...result });
+      return;
+    }
+    params = matchPath(pathname, "/api/access-requests/:id/reject");
+    if (params && method === "POST") {
+      assertAdmin(session);
+      const updated = await rejectAccessRequestSupabase({
+        requestId: params.id,
+        admin: session.dbUser
+      });
+      sendJson(res, 200, { ok: true, request: updated });
+      return;
+    }
+    if (method === "POST" && pathname === "/api/collaborators") {
+      const body = await readJsonBody(req);
+      const created = await createCollaboratorSupabase({
+        ownerUid: session.token.uid,
+        fullName: String(body.fullName ?? ""),
+        role: body.role ? String(body.role) : "",
+        active: body.active !== void 0 ? Boolean(body.active) : true
+      });
+      sendJson(res, 201, created);
+      return;
+    }
+    params = matchPath(pathname, "/api/collaborators/:id");
+    if (params && method === "PUT") {
+      const body = await readJsonBody(req);
+      const updated = await updateCollaboratorSupabase({
+        id: params.id,
+        fullName: String(body.fullName ?? ""),
+        role: body.role ? String(body.role) : "",
+        active: Boolean(body.active)
+      });
+      sendJson(res, 200, updated);
+      return;
+    }
+    if (params && method === "DELETE") {
+      assertDirectDelete(session);
+      const deletedName = await deleteCollaboratorSupabase({
+        collaboratorId: params.id,
+        actor: session.dbUser,
+        actorEmail: session.token.email || session.dbUser.email,
+        actorUid: session.token.uid
+      });
+      sendJson(res, 200, { ok: true, deletedName });
+      return;
+    }
+    params = matchPath(pathname, "/api/collaborators/:id/toggle");
+    if (params && method === "PATCH") {
+      const updated = await toggleCollaboratorActiveSupabase(params.id);
+      sendJson(res, 200, updated);
+      return;
+    }
+    if (method === "POST" && pathname === "/api/products") {
+      const body = await readJsonBody(req);
+      const created = await createProductSupabase(
+        session.token.uid,
+        body
+      );
+      sendJson(res, 201, created);
+      return;
+    }
+    params = matchPath(pathname, "/api/products/:id");
+    if (params && method === "PUT") {
+      const body = await readJsonBody(req);
+      const updated = await updateProductSupabase({
+        ...body,
+        id: params.id
+      });
+      sendJson(res, 200, updated);
+      return;
+    }
+    if (params && method === "DELETE") {
+      assertDirectDelete(session);
+      const deletedName = await deleteProductSupabase({
+        productId: params.id,
+        actor: session.dbUser,
+        actorEmail: session.token.email || session.dbUser.email,
+        actorUid: session.token.uid
+      });
+      sendJson(res, 200, { ok: true, deletedName });
+      return;
+    }
+    if (method === "POST" && pathname === "/api/movements") {
+      const body = await readJsonBody(req);
+      const result = await recordMovementSupabase({
+        id: body.id ? String(body.id) : void 0,
+        productId: String(body.productId ?? ""),
+        type: body.type === "ENTRADA" ? "ENTRADA" : "SAIDA",
+        quantity: Number(body.quantity ?? 0),
+        date: body.date ? String(body.date) : void 0,
+        withdrawnBy: body.withdrawnBy ? String(body.withdrawnBy) : void 0,
+        collaboratorId: body.collaboratorId ? String(body.collaboratorId) : void 0,
+        destination: body.destination ? String(body.destination) : void 0,
+        notes: body.notes ? String(body.notes) : void 0,
+        isNegativeStockAuthorized: body.isNegativeStockAuthorized !== void 0 ? Boolean(body.isNegativeStockAuthorized) : void 0,
+        authorizedBy: body.authorizedBy ? String(body.authorizedBy) : void 0,
+        actor: session.dbUser,
+        actorUid: session.token.uid
+      });
+      sendJson(res, 201, result);
+      return;
+    }
+    params = matchPath(pathname, "/api/movements/:id");
+    if (params && method === "DELETE") {
+      assertDirectDelete(session);
+      const result = await deleteMovementSupabase({
+        movementId: params.id,
+        actor: session.dbUser,
+        actorEmail: session.token.email || session.dbUser.email,
+        actorUid: session.token.uid
+      });
+      sendJson(res, 200, { ok: true, ...result });
+      return;
+    }
+    if (method === "POST" && pathname === "/api/negative-requests") {
+      const body = await readJsonBody(req);
+      const result = await createNegativeRequestSupabase({
+        id: body.id ? String(body.id) : void 0,
+        productId: String(body.productId ?? ""),
+        requestedQuantity: Number(body.requestedQuantity ?? 0),
+        withdrawnBy: String(body.withdrawnBy ?? ""),
+        collaboratorId: body.collaboratorId ? String(body.collaboratorId) : void 0,
+        destination: String(body.destination ?? ""),
+        reason: String(body.reason ?? ""),
+        actor: session.dbUser,
+        actorUid: session.token.uid
+      });
+      sendJson(res, 201, result);
+      return;
+    }
+    params = matchPath(pathname, "/api/negative-requests/:id/approve");
+    if (params && method === "POST") {
+      assertAdmin(session);
+      const result = await approveNegativeRequestSupabase({
+        requestId: params.id,
+        admin: session.dbUser,
+        adminUid: session.token.uid
+      });
+      sendJson(res, 200, { ok: true, ...result });
+      return;
+    }
+    params = matchPath(pathname, "/api/negative-requests/:id/reject");
+    if (params && method === "POST") {
+      assertAdmin(session);
+      await rejectNegativeRequestSupabase(params.id, session.dbUser.name);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    params = matchPath(pathname, "/api/negative-requests/:id");
+    if (params && method === "DELETE") {
+      assertDirectDelete(session);
+      await deleteNegativeRequestSupabase({
+        requestId: params.id,
+        actor: session.dbUser,
+        actorEmail: session.token.email || session.dbUser.email,
+        actorUid: session.token.uid
+      });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (method === "POST" && pathname === "/api/deletion-requests") {
+      const body = await readJsonBody(req);
+      const result = await createDeletionRequestSupabase({
+        recordType: body.recordType,
+        targetId: String(body.targetId ?? ""),
+        targetCode: String(body.targetCode ?? ""),
+        targetName: String(body.targetName ?? ""),
+        targetDetails: String(body.targetDetails ?? ""),
+        quantity: Number(body.quantity ?? 0),
+        reason: String(body.reason ?? ""),
+        actor: session.dbUser,
+        actorEmail: session.token.email || session.dbUser.email,
+        actorUid: session.token.uid
+      });
+      sendJson(res, 201, result);
+      return;
+    }
+    params = matchPath(pathname, "/api/deletion-requests/:id/approve");
+    if (params && method === "POST") {
+      assertAdmin(session);
+      const result = await approveDeletionRequestSupabase({
+        requestId: params.id,
+        admin: session.dbUser,
+        adminEmail: session.token.email || session.dbUser.email,
+        adminUid: session.token.uid
+      });
+      sendJson(res, 200, { ok: true, ...result });
+      return;
+    }
+    params = matchPath(pathname, "/api/deletion-requests/:id/reject");
+    if (params && method === "POST") {
+      assertAdmin(session);
+      const result = await rejectDeletionRequestSupabase({
+        requestId: params.id,
+        admin: session.dbUser,
+        adminEmail: session.token.email || session.dbUser.email
+      });
+      sendJson(res, 200, { ok: true, ...result });
+      return;
+    }
+    if (method === "POST" && pathname === "/api/admin/supabase-sync") {
+      assertAdmin(session);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (method === "POST" && pathname === "/api/admin/reset") {
+      assertAdmin(session);
+      await resetAllDataSupabase(
+        session.token.uid,
+        session.token.email || session.dbUser.email,
+        session.dbUser.name
+      );
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    sendJson(res, 404, { error: "Rota de API n\xE3o encontrada." });
+  } catch (err) {
+    if (err instanceof DomainError) {
+      sendJson(res, err.statusCode, { error: err.message });
+      return;
+    }
+    console.error("Vercel API unhandled error:", err);
+    sendJson(res, 500, {
+      error: err instanceof Error && err.message ? err.message : "Erro interno ao processar opera\xE7\xE3o no servidor."
+    });
   }
 }
 export {
