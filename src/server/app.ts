@@ -1,0 +1,549 @@
+import express from 'express';
+import type { Express, NextFunction, Request, Response } from 'express';
+import { requireAdmin, requireAuth, requireDirectDelete } from '../middleware/auth.ts';
+import type { AuthRequest } from '../middleware/auth.ts';
+import { isSqlDatabaseConfigured } from '../db/shared.ts';
+import {
+  approveAccessRequestInDb,
+  approveDeletionRequestInDb,
+  approveNegativeRequestInDb,
+  checkEmailInvitationStatus,
+  createAccessRequestInDb,
+  createCollaboratorInDb,
+  createDeletionRequestInDb,
+  createNegativeRequestInDb,
+  createProductInDb,
+  createUserInDb,
+  deleteCollaboratorInDb,
+  deleteMovementInDb,
+  deleteNegativeRequestInDb,
+  deleteProductInDb,
+  deleteUserInDb,
+  DomainError,
+  getBootstrapData,
+  recordMovementInDb,
+  rejectAccessRequestInDb,
+  rejectDeletionRequestInDb,
+  rejectNegativeRequestInDb,
+  resetAllDataInDb,
+  toggleCollaboratorActiveInDb,
+  updateCollaboratorInDb,
+  updateManagedListsInDb,
+  updateProductInDb,
+  updateSystemSettingsInDb,
+  updateUserDeletePermissionInDb,
+  updateUserInDb,
+  updateUserPermissionsInDb,
+} from '../db/repository.ts';
+import {
+  getSupabaseSyncBlockReason,
+  isSupabaseSyncEnabled,
+  syncAllTablesToSupabase,
+} from '../lib/supabase-sync.ts';
+
+const asyncHandler =
+  (fn: (req: AuthRequest, res: Response, next: NextFunction) => Promise<void>) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req as AuthRequest, res, next)).catch(next);
+  };
+
+export function createApiApp(): Express {
+  const app = express();
+
+  app.use(express.json({ limit: '5mb' }));
+
+  // Health check
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      ok: true,
+      mode: isSqlDatabaseConfigured() ? 'cloudsql' : 'supabase',
+      supabaseConfigured: isSupabaseSyncEnabled(),
+    });
+  });
+
+  // Pre-registration check for first access by email
+  app.post(
+    '/api/auth/verify-invite',
+    asyncHandler(async (req, res) => {
+      const email = String(req.body?.email ?? '').trim();
+      const status = await checkEmailInvitationStatus(email);
+      if (!status.authorized) {
+        res.status(403).json({ error: status.message || 'E-mail não autorizado.' });
+        return;
+      }
+      res.json(status);
+    })
+  );
+
+  // Public access request ("Solicitar Acesso / Pedido para entrar no aplicativo")
+  app.post(
+    '/api/auth/request-access',
+    asyncHandler(async (req, res) => {
+      const result = await createAccessRequestInDb({
+        name: String(req.body?.name ?? ''),
+        email: String(req.body?.email ?? ''),
+        role: req.body?.role ? String(req.body.role) : '',
+        department: req.body?.department ? String(req.body.department) : '',
+        reason: req.body?.reason ? String(req.body.reason) : '',
+      });
+      res.status(result.alreadyAuthorized ? 200 : 201).json(result);
+    })
+  );
+
+  // Bootstrap all state for authenticated & authorized user
+  app.get(
+    '/api/bootstrap',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const data = await getBootstrapData(req.dbUser!, req.user!.uid);
+      res.json(data);
+    })
+  );
+
+  // Settings: Toggle product photos (any authenticated user)
+  app.patch(
+    '/api/settings/photos',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const showProductPhotos = Boolean(req.body?.showProductPhotos);
+      await updateSystemSettingsInDb({ showProductPhotos });
+      res.json({ ok: true, showProductPhotos });
+    })
+  );
+
+  // Settings: Update full settings (Admin only)
+  app.put(
+    '/api/settings',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      await updateSystemSettingsInDb(req.body ?? {});
+      res.json({ ok: true });
+    })
+  );
+
+  // Managed Lists (Admin only)
+  app.put(
+    '/api/lists',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const { lists, renameGroup, renameRole } = req.body ?? {};
+      if (
+        !lists ||
+        !Array.isArray(lists.groups) ||
+        !Array.isArray(lists.roles) ||
+        !Array.isArray(lists.destinations)
+      ) {
+        throw new DomainError('Dados de listas inválidos.', 400);
+      }
+      await updateManagedListsInDb({ lists, renameGroup, renameRole });
+      res.json({ ok: true });
+    })
+  );
+
+  // Users / App Access (Admin only)
+  app.post(
+    '/api/users',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const created = await createUserInDb(req.body ?? {});
+      res.status(201).json(created);
+    })
+  );
+
+  app.put(
+    '/api/users/:id',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const updated = await updateUserInDb({ ...(req.body ?? {}), id });
+      res.json(updated);
+    })
+  );
+
+  app.patch(
+    '/api/users/:id/permissions',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      await updateUserPermissionsInDb(id, req.body?.permissions ?? {});
+      res.json({ ok: true });
+    })
+  );
+
+  app.patch(
+    '/api/users/:id/delete-permission',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      await updateUserDeletePermissionInDb(id, Boolean(req.body?.canDelete));
+      res.json({ ok: true });
+    })
+  );
+
+  app.delete(
+    '/api/users/:id',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      await deleteUserInDb(id);
+      res.json({ ok: true });
+    })
+  );
+
+  // App Access Requests (Approve / Reject by Admin)
+  app.post(
+    '/api/access-requests/:id/approve',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const result = await approveAccessRequestInDb({
+        requestId: id,
+        admin: req.dbUser!,
+        role: req.body?.role ? String(req.body.role) : undefined,
+        department: req.body?.department ? String(req.body.department) : undefined,
+        canDelete: req.body?.canDelete !== undefined ? Boolean(req.body.canDelete) : undefined,
+        permissions: req.body?.permissions,
+      });
+      res.json({ ok: true, ...result });
+    })
+  );
+
+  app.post(
+    '/api/access-requests/:id/reject',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const updated = await rejectAccessRequestInDb({
+        requestId: id,
+        admin: req.dbUser!,
+      });
+      res.json({ ok: true, request: updated });
+    })
+  );
+
+  // Collaborators (Field workers without app access)
+  app.post(
+    '/api/collaborators',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const created = await createCollaboratorInDb({
+        ownerUid: req.user!.uid,
+        fullName: String(req.body?.fullName ?? ''),
+        role: req.body?.role ? String(req.body.role) : '',
+        active: req.body?.active !== undefined ? Boolean(req.body.active) : true,
+      });
+      res.status(201).json(created);
+    })
+  );
+
+  app.put(
+    '/api/collaborators/:id',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const updated = await updateCollaboratorInDb({
+        id,
+        fullName: String(req.body?.fullName ?? ''),
+        role: req.body?.role ? String(req.body.role) : '',
+        active: Boolean(req.body?.active),
+      });
+      res.json(updated);
+    })
+  );
+
+  app.patch(
+    '/api/collaborators/:id/toggle',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const updated = await toggleCollaboratorActiveInDb(id);
+      res.json(updated);
+    })
+  );
+
+  app.delete(
+    '/api/collaborators/:id',
+    requireAuth,
+    requireDirectDelete,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const deletedName = await deleteCollaboratorInDb({
+        collaboratorId: id,
+        actor: req.dbUser!,
+        actorEmail: req.user!.email || req.dbUser!.email,
+        actorUid: req.user!.uid,
+      });
+      res.json({ ok: true, deletedName });
+    })
+  );
+
+  // Products
+  app.post(
+    '/api/products',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const created = await createProductInDb(req.user!.uid, req.body ?? {});
+      res.status(201).json(created);
+    })
+  );
+
+  app.put(
+    '/api/products/:id',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const updated = await updateProductInDb({ ...(req.body ?? {}), id });
+      res.json(updated);
+    })
+  );
+
+  app.delete(
+    '/api/products/:id',
+    requireAuth,
+    requireDirectDelete,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const deletedName = await deleteProductInDb({
+        productId: id,
+        actor: req.dbUser!,
+        actorEmail: req.user!.email || req.dbUser!.email,
+        actorUid: req.user!.uid,
+      });
+      res.json({ ok: true, deletedName });
+    })
+  );
+
+  // Stock Movements
+  app.post(
+    '/api/movements',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const result = await recordMovementInDb({
+        id: req.body?.id,
+        productId: String(req.body?.productId ?? ''),
+        type: req.body?.type === 'ENTRADA' ? 'ENTRADA' : 'SAIDA',
+        quantity: Number(req.body?.quantity ?? 0),
+        date: req.body?.date ? String(req.body.date) : undefined,
+        withdrawnBy: req.body?.withdrawnBy ? String(req.body.withdrawnBy) : undefined,
+        collaboratorId: req.body?.collaboratorId ? String(req.body.collaboratorId) : undefined,
+        destination: req.body?.destination ? String(req.body.destination) : undefined,
+        notes: req.body?.notes ? String(req.body.notes) : undefined,
+        isNegativeStockAuthorized:
+          req.body?.isNegativeStockAuthorized !== undefined
+            ? Boolean(req.body.isNegativeStockAuthorized)
+            : undefined,
+        authorizedBy: req.body?.authorizedBy ? String(req.body.authorizedBy) : undefined,
+        actor: req.dbUser!,
+        actorUid: req.user!.uid,
+      });
+      res.status(201).json(result);
+    })
+  );
+
+  app.delete(
+    '/api/movements/:id',
+    requireAuth,
+    requireDirectDelete,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const result = await deleteMovementInDb({
+        movementId: id,
+        actor: req.dbUser!,
+        actorEmail: req.user!.email || req.dbUser!.email,
+        actorUid: req.user!.uid,
+      });
+      res.json({ ok: true, ...result });
+    })
+  );
+
+  // Negative Stock Requests
+  app.post(
+    '/api/negative-requests',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const result = await createNegativeRequestInDb({
+        id: req.body?.id,
+        productId: String(req.body?.productId ?? ''),
+        requestedQuantity: Number(req.body?.requestedQuantity ?? 0),
+        withdrawnBy: String(req.body?.withdrawnBy ?? ''),
+        collaboratorId: req.body?.collaboratorId ? String(req.body.collaboratorId) : undefined,
+        destination: String(req.body?.destination ?? ''),
+        reason: String(req.body?.reason ?? ''),
+        actor: req.dbUser!,
+        actorUid: req.user!.uid,
+      });
+      res.status(201).json(result);
+    })
+  );
+
+  app.post(
+    '/api/negative-requests/:id/approve',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const result = await approveNegativeRequestInDb({
+        requestId: id,
+        admin: req.dbUser!,
+        adminUid: req.user!.uid,
+      });
+      res.json({ ok: true, ...result });
+    })
+  );
+
+  app.post(
+    '/api/negative-requests/:id/reject',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      await rejectNegativeRequestInDb(id, req.dbUser!.name);
+      res.json({ ok: true });
+    })
+  );
+
+  app.delete(
+    '/api/negative-requests/:id',
+    requireAuth,
+    requireDirectDelete,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      await deleteNegativeRequestInDb({
+        requestId: id,
+        actor: req.dbUser!,
+        actorEmail: req.user!.email || req.dbUser!.email,
+        actorUid: req.user!.uid,
+      });
+      res.json({ ok: true });
+    })
+  );
+
+  // Deletion Requests & Approval Workflow
+  app.post(
+    '/api/deletion-requests',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const result = await createDeletionRequestInDb({
+        recordType: req.body?.recordType,
+        targetId: String(req.body?.targetId ?? ''),
+        targetCode: String(req.body?.targetCode ?? ''),
+        targetName: String(req.body?.targetName ?? ''),
+        targetDetails: String(req.body?.targetDetails ?? ''),
+        quantity: Number(req.body?.quantity ?? 0),
+        reason: String(req.body?.reason ?? ''),
+        actor: req.dbUser!,
+        actorEmail: req.user!.email || req.dbUser!.email,
+        actorUid: req.user!.uid,
+      });
+      res.status(201).json(result);
+    })
+  );
+
+  app.post(
+    '/api/deletion-requests/:id/approve',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const result = await approveDeletionRequestInDb({
+        requestId: id,
+        admin: req.dbUser!,
+        adminEmail: req.user!.email || req.dbUser!.email,
+        adminUid: req.user!.uid,
+      });
+      res.json({ ok: true, ...result });
+    })
+  );
+
+  app.post(
+    '/api/deletion-requests/:id/reject',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const result = await rejectDeletionRequestInDb({
+        requestId: id,
+        admin: req.dbUser!,
+        adminEmail: req.user!.email || req.dbUser!.email,
+      });
+      res.json({ ok: true, ...result });
+    })
+  );
+
+  // Admin Force Full Supabase Sync
+  app.post(
+    '/api/admin/supabase-sync',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (_req, res) => {
+      if (!isSqlDatabaseConfigured()) {
+        res.json({ ok: true, mode: 'supabase' });
+        return;
+      }
+      if (!isSupabaseSyncEnabled()) {
+        throw new DomainError(
+          'As variáveis SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY ainda não estão configuradas nos Secrets.',
+          400
+        );
+      }
+      const blockReason = getSupabaseSyncBlockReason();
+      if (blockReason) {
+        throw new DomainError(blockReason, 400);
+      }
+      const ok = await syncAllTablesToSupabase();
+      if (!ok) {
+        throw new DomainError(
+          getSupabaseSyncBlockReason() ||
+            'Não foi possível concluir a sincronização com o Supabase. Verifique URL, chave Service Role e se as tabelas foram criadas.',
+          502
+        );
+      }
+      res.json({ ok: true });
+    })
+  );
+
+  // Admin Reset Database
+  app.post(
+    '/api/admin/reset',
+    requireAuth,
+    requireAdmin,
+    asyncHandler(async (req, res) => {
+      await resetAllDataInDb(
+        req.user!.uid,
+        req.user!.email || req.dbUser!.email,
+        req.dbUser!.name
+      );
+      res.json({ ok: true });
+    })
+  );
+
+  // Unmatched API routes should always return JSON 404
+  app.all('/api/*', (_req, res) => {
+    res.status(404).json({ error: 'Rota de API não encontrada.' });
+  });
+
+  // API error handler (Two-layer: sanitized client JSON, full server log)
+  app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (err instanceof DomainError) {
+      res.status(err.statusCode).json({ error: err.message });
+      return;
+    }
+    console.error('Unhandled API error:', err);
+    const message =
+      err instanceof Error && err.message
+        ? err.message
+        : 'Erro interno ao processar operação no servidor.';
+    res.status(500).json({ error: message });
+  });
+
+  return app;
+}

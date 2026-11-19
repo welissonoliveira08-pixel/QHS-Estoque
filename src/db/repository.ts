@@ -51,52 +51,56 @@ import {
   syncUsersToSupabase,
   syncUserToSupabase,
 } from '../lib/supabase-sync.ts';
+import {
+  BOOTSTRAPPED_ADMIN_EMAIL,
+  DomainError,
+  FULL_ADMIN_PERMISSIONS,
+  ORG_ID,
+  formatDateTimeNow,
+  formatDateToday,
+  isSqlDatabaseConfigured,
+  normalizePermissions,
+} from './shared.ts';
+import {
+  approveAccessRequestSupabase,
+  approveDeletionRequestSupabase,
+  approveNegativeRequestSupabase,
+  checkEmailInvitationStatusSupabase,
+  createAccessRequestSupabase,
+  createCollaboratorSupabase,
+  createDeletionRequestSupabase,
+  createNegativeRequestSupabase,
+  createProductSupabase,
+  createUserSupabase,
+  deleteCollaboratorSupabase,
+  deleteMovementSupabase,
+  deleteNegativeRequestSupabase,
+  deleteProductSupabase,
+  deleteUserSupabase,
+  getBootstrapDataSupabase,
+  recordMovementSupabase,
+  rejectAccessRequestSupabase,
+  rejectDeletionRequestSupabase,
+  rejectNegativeRequestSupabase,
+  resetAllDataSupabase,
+  resolveAuthenticatedUserSupabase,
+  toggleCollaboratorActiveSupabase,
+  updateCollaboratorSupabase,
+  updateManagedListsSupabase,
+  updateProductSupabase,
+  updateSystemSettingsSupabase,
+  updateUserDeletePermissionSupabase,
+  updateUserPermissionsSupabase,
+  updateUserSupabase,
+} from './supabaseRepository.ts';
 
-export const ORG_ID = 'qhs-engenharia';
-export const BOOTSTRAPPED_ADMIN_EMAIL = 'welisson.oliveira08@gmail.com';
-
-export class DomainError extends Error {
-  statusCode: number;
-
-  constructor(message: string, statusCode = 400) {
-    super(message);
-    this.statusCode = statusCode;
-  }
-}
-
-export function formatDateToday(): string {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-}
-
-export function formatDateTimeNow(): string {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-}
-
-export function normalizePermissions(perms?: Partial<UserPermissions> | null): UserPermissions {
-  return {
-    dashboard: Boolean(perms?.dashboard),
-    produtos: Boolean(perms?.produtos),
-    entradas: Boolean(perms?.entradas),
-    saidas: Boolean(perms?.saidas),
-    colaboradores:
-      perms?.colaboradores !== undefined ? Boolean(perms.colaboradores) : Boolean(perms?.saidas),
-    relatorios: Boolean(perms?.relatorios),
-    estatisticas: Boolean(perms?.estatisticas),
-    configuracoes: Boolean(perms?.configuracoes),
-  };
-}
-
-const FULL_ADMIN_PERMISSIONS: UserPermissions = {
-  dashboard: true,
-  produtos: true,
-  entradas: true,
-  saidas: true,
-  colaboradores: true,
-  relatorios: true,
-  estatisticas: true,
-  configuracoes: true,
+export {
+  BOOTSTRAPPED_ADMIN_EMAIL,
+  DomainError,
+  ORG_ID,
+  formatDateTimeNow,
+  formatDateToday,
+  normalizePermissions,
 };
 
 function mapUserRow(row: typeof users.$inferSelect): User {
@@ -311,6 +315,9 @@ export async function checkEmailInvitationStatus(email: string): Promise<{
   alreadyActivated: boolean;
   message?: string;
 }> {
+  if (!isSqlDatabaseConfigured()) {
+    return checkEmailInvitationStatusSupabase(email);
+  }
   const emailLower = email.trim().toLowerCase();
   if (!emailLower || !emailLower.includes('@')) {
     return {
@@ -373,6 +380,9 @@ export async function resolveAuthenticatedUser(params: {
   email: string;
   displayName?: string;
 }): Promise<{ authorized: boolean; isRealAdmin: boolean; user?: User; errorMessage?: string }> {
+  if (!isSqlDatabaseConfigured()) {
+    return resolveAuthenticatedUserSupabase(params);
+  }
   const emailLower = params.email.trim().toLowerCase();
   const isBootstrapped = emailLower === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
 
@@ -468,6 +478,9 @@ export async function resolveAuthenticatedUser(params: {
 }
 
 export async function getBootstrapData(currentUser: User, uid: string) {
+  if (!isSqlDatabaseConfigured()) {
+    return getBootstrapDataSupabase(currentUser, uid);
+  }
   try {
     await ensureDefaultsSeeded();
     await ensureInitialSupabaseSync();
@@ -615,6 +628,9 @@ export async function getBootstrapData(currentUser: User, uid: string) {
 }
 
 export async function updateSystemSettingsInDb(newSettings: Partial<SystemSettings>) {
+  if (!isSqlDatabaseConfigured()) {
+    return updateSystemSettingsSupabase(newSettings);
+  }
   try {
     await ensureDefaultsSeeded();
     const updatePayload: Record<string, unknown> = { updatedAt: new Date() };
@@ -655,6 +671,9 @@ export async function updateManagedListsInDb(params: {
   renameGroup?: { oldName: string; newName: string };
   renameRole?: { oldName: string; newName: string };
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return updateManagedListsSupabase(params);
+  }
   try {
     const result = await db.transaction(async (tx) => {
       const updatedLists = await tx
@@ -714,6 +733,9 @@ export async function updateManagedListsInDb(params: {
 }
 
 export async function createUserInDb(newUser: Omit<User, 'id' | 'createdAt'>) {
+  if (!isSqlDatabaseConfigured()) {
+    return createUserSupabase(newUser);
+  }
   const emailLower = newUser.email.trim().toLowerCase();
   if (!emailLower || !newUser.name.trim()) {
     throw new DomainError('Nome e e-mail do usuário são obrigatórios.', 400);
@@ -746,6 +768,9 @@ export async function createUserInDb(newUser: Omit<User, 'id' | 'createdAt'>) {
 }
 
 export async function updateUserInDb(updatedUser: User) {
+  if (!isSqlDatabaseConfigured()) {
+    return updateUserSupabase(updatedUser);
+  }
   const emailLower = updatedUser.email.trim().toLowerCase();
   try {
     const updated = await db
@@ -777,6 +802,9 @@ export async function updateUserInDb(updatedUser: User) {
 }
 
 export async function updateUserPermissionsInDb(userId: string, permissions: UserPermissions) {
+  if (!isSqlDatabaseConfigured()) {
+    return updateUserPermissionsSupabase(userId, permissions);
+  }
   try {
     const updated = await db
       .update(users)
@@ -792,6 +820,9 @@ export async function updateUserPermissionsInDb(userId: string, permissions: Use
 }
 
 export async function updateUserDeletePermissionInDb(userId: string, canDelete: boolean) {
+  if (!isSqlDatabaseConfigured()) {
+    return updateUserDeletePermissionSupabase(userId, canDelete);
+  }
   try {
     const existing = await db.select().from(users).where(eq(users.id, userId)).limit(1);
     if (!existing[0]) throw new DomainError('Usuário não encontrado.', 404);
@@ -813,6 +844,9 @@ export async function updateUserDeletePermissionInDb(userId: string, canDelete: 
 }
 
 export async function deleteUserInDb(userId: string) {
+  if (!isSqlDatabaseConfigured()) {
+    return deleteUserSupabase(userId);
+  }
   if (userId === 'user-owner') {
     throw new DomainError('Não é permitido excluir o Administrador principal.', 400);
   }
@@ -836,6 +870,9 @@ export async function createAccessRequestInDb(params: {
   alreadyAuthorized?: boolean;
   message: string;
 }> {
+  if (!isSqlDatabaseConfigured()) {
+    return createAccessRequestSupabase(params);
+  }
   const emailLower = params.email.trim().toLowerCase();
   const cleanName = params.name.trim();
 
@@ -937,6 +974,9 @@ export async function approveAccessRequestInDb(params: {
   canDelete?: boolean;
   permissions?: Partial<UserPermissions>;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return approveAccessRequestSupabase(params);
+  }
   try {
     const result = await db.transaction(async (tx) => {
       const reqRows = await tx
@@ -1040,6 +1080,9 @@ export async function approveAccessRequestInDb(params: {
 }
 
 export async function rejectAccessRequestInDb(params: { requestId: string; admin: User }) {
+  if (!isSqlDatabaseConfigured()) {
+    return rejectAccessRequestSupabase(params);
+  }
   try {
     const reqRows = await db
       .select()
@@ -1081,6 +1124,9 @@ export async function createCollaboratorInDb(params: {
   role?: string;
   active?: boolean;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return createCollaboratorSupabase(params);
+  }
   const trimmedName = params.fullName.trim();
   if (trimmedName.length < 2) {
     throw new DomainError('Informe o nome completo do colaborador (mínimo 2 caracteres).', 400);
@@ -1133,6 +1179,9 @@ export async function updateCollaboratorInDb(params: {
   role?: string;
   active: boolean;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return updateCollaboratorSupabase(params);
+  }
   const trimmedName = params.fullName.trim();
   if (trimmedName.length < 2) {
     throw new DomainError('Informe o nome completo do colaborador (mínimo 2 caracteres).', 400);
@@ -1182,6 +1231,9 @@ export async function updateCollaboratorInDb(params: {
 }
 
 export async function toggleCollaboratorActiveInDb(collaboratorId: string) {
+  if (!isSqlDatabaseConfigured()) {
+    return toggleCollaboratorActiveSupabase(collaboratorId);
+  }
   try {
     const existing = await db
       .select()
@@ -1219,6 +1271,9 @@ export async function deleteCollaboratorInDb(params: {
   actorEmail: string;
   actorUid: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return deleteCollaboratorSupabase(params);
+  }
   try {
     const result = await db.transaction(async (tx) => {
       const targetRows = await tx
@@ -1291,6 +1346,9 @@ export async function createProductInDb(
   ownerUid: string,
   prodData: Omit<Product, 'id' | 'createdAt' | 'updatedAt'>
 ) {
+  if (!isSqlDatabaseConfigured()) {
+    return createProductSupabase(ownerUid, prodData);
+  }
   try {
     const id = `prod-${Date.now()}`;
     const today = formatDateToday();
@@ -1322,6 +1380,9 @@ export async function createProductInDb(
 }
 
 export async function updateProductInDb(updatedProduct: Product) {
+  if (!isSqlDatabaseConfigured()) {
+    return updateProductSupabase(updatedProduct);
+  }
   try {
     const updated = await db
       .update(products)
@@ -1357,6 +1418,9 @@ export async function deleteProductInDb(params: {
   actorEmail: string;
   actorUid: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return deleteProductSupabase(params);
+  }
   try {
     const result = await db.transaction(async (tx) => {
       const targetRows = await tx
@@ -1427,6 +1491,9 @@ export async function recordMovementInDb(params: {
   actor: User;
   actorUid: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return recordMovementSupabase(params);
+  }
   const qty = Number(params.quantity);
   if (Number.isNaN(qty) || qty <= 0) {
     throw new DomainError('Quantidade deve ser maior que zero.', 400);
@@ -1545,6 +1612,9 @@ export async function deleteMovementInDb(params: {
   actorEmail: string;
   actorUid: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return deleteMovementSupabase(params);
+  }
   try {
     const result = await db.transaction(async (tx) => {
       const movRows = await tx
@@ -1645,6 +1715,9 @@ export async function createNegativeRequestInDb(params: {
   actor: User;
   actorUid: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return createNegativeRequestSupabase(params);
+  }
   try {
     const prodRows = await db
       .select()
@@ -1718,6 +1791,9 @@ export async function approveNegativeRequestInDb(params: {
   admin: User;
   adminUid: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return approveNegativeRequestSupabase(params);
+  }
   try {
     const result = await db.transaction(async (tx) => {
       const reqRows = await tx
@@ -1815,6 +1891,9 @@ export async function approveNegativeRequestInDb(params: {
 }
 
 export async function rejectNegativeRequestInDb(requestId: string, adminName: string) {
+  if (!isSqlDatabaseConfigured()) {
+    return rejectNegativeRequestSupabase(requestId, adminName);
+  }
   try {
     const updated = await db
       .update(negativeRequests)
@@ -1842,6 +1921,9 @@ export async function deleteNegativeRequestInDb(params: {
   actorEmail: string;
   actorUid: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return deleteNegativeRequestSupabase(params);
+  }
   try {
     const result = await db.transaction(async (tx) => {
       const targetRows = await tx
@@ -1905,6 +1987,9 @@ export async function createDeletionRequestInDb(params: {
   actorEmail: string;
   actorUid: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return createDeletionRequestSupabase(params);
+  }
   const trimmedReason = params.reason.trim();
   if (trimmedReason.length < 3) {
     throw new DomainError(
@@ -1972,6 +2057,9 @@ export async function approveDeletionRequestInDb(params: {
   adminEmail: string;
   adminUid: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return approveDeletionRequestSupabase(params);
+  }
   try {
     const result = await db.transaction(async (tx) => {
       const reqRows = await tx
@@ -2123,6 +2211,9 @@ export async function rejectDeletionRequestInDb(params: {
   admin: User;
   adminEmail: string;
 }) {
+  if (!isSqlDatabaseConfigured()) {
+    return rejectDeletionRequestSupabase(params);
+  }
   try {
     const reqRows = await db
       .select()
@@ -2159,6 +2250,9 @@ export async function rejectDeletionRequestInDb(params: {
 }
 
 export async function resetAllDataInDb(adminUid: string, adminEmail: string, adminName: string) {
+  if (!isSqlDatabaseConfigured()) {
+    return resetAllDataSupabase(adminUid, adminEmail, adminName);
+  }
   try {
     const result = await db.transaction(async (tx) => {
       await tx.delete(movements);

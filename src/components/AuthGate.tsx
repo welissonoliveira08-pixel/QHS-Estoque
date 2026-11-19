@@ -243,13 +243,14 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
             </div>
 
             {firebaseUser?.email && (
-              <div className="bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-xs text-zinc-700 break-all">
-                Conta autenticada: <strong className="font-mono">{firebaseUser.email}</strong>
+              <div className="bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-xs text-zinc-700 break-words">
+                <span className="block text-[11px] text-zinc-500">Conta autenticada:</span>
+                <strong className="font-mono text-[11px] sm:text-xs">{firebaseUser.email}</strong>
               </div>
             )}
 
             <p className="text-[11px] text-zinc-500 leading-relaxed">
-              Se você acabou de atualizar ou publicar o aplicativo, aguarde alguns segundos e toque em <strong>Tentar Novamente</strong>. Caso o erro HTTP 404 persista, republique o aplicativo atualizado no AI Studio para ativar o servidor.
+              Se você acabou de atualizar ou publicar o aplicativo, aguarde alguns segundos e toque em <strong>Tentar Novamente</strong>. Se estiver usando na <strong>Vercel</strong>, confira se as variáveis <code className="font-mono">SUPABASE_URL</code> e <code className="font-mono">SUPABASE_SERVICE_ROLE_KEY</code> estão configuradas e faça um Redeploy.
             </p>
 
             <div className="space-y-2.5 pt-1">
