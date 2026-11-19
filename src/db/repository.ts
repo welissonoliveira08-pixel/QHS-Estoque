@@ -1,6 +1,7 @@
 import { and, eq, sql } from 'drizzle-orm';
 import { db } from './index.ts';
 import {
+  accessRequests,
   collaborators,
   deletionLogs,
   deletionRequests,
@@ -12,6 +13,8 @@ import {
   users,
 } from './schema.ts';
 import type {
+  AccessRequest,
+  AccessRequestStatus,
   Collaborator,
   DeletionLog,
   DeletionRecordType,
@@ -32,6 +35,8 @@ import {
   deleteProductFromSupabase,
   deleteUserFromSupabase,
   ensureInitialSupabaseSync,
+  pullPendingAccessRequestsFromSupabase,
+  syncAccessRequestToSupabase,
   syncCollaboratorToSupabase,
   syncDeletionLogToSupabase,
   syncDeletionRequestToSupabase,
@@ -255,6 +260,27 @@ function mapDeletionLogRow(row: typeof deletionLogs.$inferSelect): DeletionLog {
   };
 }
 
+function mapAccessRequestRow(row: typeof accessRequests.$inferSelect): AccessRequest {
+  const status: AccessRequestStatus =
+    row.status === 'APROVADO'
+      ? 'APROVADO'
+      : row.status === 'RECUSADO'
+      ? 'RECUSADO'
+      : 'PENDENTE';
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role: row.role || '',
+    department: row.department || '',
+    reason: row.reason || '',
+    date: row.date,
+    status,
+    reviewedBy: row.reviewedBy ?? undefined,
+    reviewedAt: row.reviewedAt ?? undefined,
+  };
+}
+
 async function ensureDefaultsSeeded() {
   await db
     .insert(systemSettings)
@@ -446,6 +472,36 @@ export async function getBootstrapData(currentUser: User, uid: string) {
     await ensureDefaultsSeeded();
     await ensureInitialSupabaseSync();
 
+    if (currentUser.isAdmin) {
+      const remotePending = await pullPendingAccessRequestsFromSupabase();
+      if (remotePending.length > 0) {
+        const existingEmailsRows = await db
+          .select({ email: users.email, active: users.active })
+          .from(users);
+        const activeEmailSet = new Set(
+          existingEmailsRows.filter((u) => u.active).map((u) => u.email.toLowerCase())
+        );
+
+        for (const item of remotePending) {
+          if (!item.email || activeEmailSet.has(item.email)) continue;
+          await db
+            .insert(accessRequests)
+            .values({
+              id: item.id,
+              orgId: item.orgId || ORG_ID,
+              name: item.name.slice(0, 120),
+              email: item.email.slice(0, 200),
+              role: item.role.slice(0, 100),
+              department: item.department.slice(0, 100),
+              reason: item.reason.slice(0, 500),
+              date: item.date || formatDateTimeNow(),
+              status: 'PENDENTE',
+            })
+            .onConflictDoNothing({ target: accessRequests.id });
+        }
+      }
+    }
+
     const [
       allUsersRows,
       collabRows,
@@ -454,6 +510,7 @@ export async function getBootstrapData(currentUser: User, uid: string) {
       negRows,
       delReqRows,
       delLogRows,
+      accessReqRows,
       listsRows,
       settingsRows,
     ] = await Promise.all([
@@ -469,6 +526,7 @@ export async function getBootstrapData(currentUser: User, uid: string) {
             .from(deletionRequests)
             .where(eq(deletionRequests.requestedByUid, uid)),
       currentUser.isAdmin ? db.select().from(deletionLogs) : Promise.resolve([]),
+      currentUser.isAdmin ? db.select().from(accessRequests) : Promise.resolve([]),
       db.select().from(managedLists).where(eq(managedLists.id, 'global')).limit(1),
       db.select().from(systemSettings).where(eq(systemSettings.id, 'global')).limit(1),
     ]);
@@ -512,6 +570,10 @@ export async function getBootstrapData(currentUser: User, uid: string) {
       .map(mapDeletionLogRow)
       .sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
 
+    const mappedAccessRequests = accessReqRows
+      .map(mapAccessRequestRow)
+      .sort((a, b) => b.date.localeCompare(a.date));
+
     const lists: ManagedLists = listsRows[0]
       ? {
           groups: Array.isArray(listsRows[0].groups) ? listsRows[0].groups : INITIAL_LISTS.groups,
@@ -542,6 +604,7 @@ export async function getBootstrapData(currentUser: User, uid: string) {
       negativeRequests: mappedNegRequests,
       deletionRequests: mappedDelRequests,
       deletionLogs: mappedDelLogs,
+      accessRequests: mappedAccessRequests,
       managedLists: lists,
       settings,
     };
@@ -759,6 +822,256 @@ export async function deleteUserInDb(userId: string) {
   } catch (error) {
     console.error('Database query failed in deleteUserInDb:', error);
     throw new Error('Falha ao excluir usuário.', { cause: error });
+  }
+}
+
+export async function createAccessRequestInDb(params: {
+  name: string;
+  email: string;
+  role?: string;
+  department?: string;
+  reason?: string;
+}): Promise<{
+  request?: AccessRequest;
+  alreadyAuthorized?: boolean;
+  message: string;
+}> {
+  const emailLower = params.email.trim().toLowerCase();
+  const cleanName = params.name.trim();
+
+  if (!emailLower || !emailLower.includes('@')) {
+    throw new DomainError('Informe um endereço de e-mail válido.', 400);
+  }
+  if (cleanName.length < 2) {
+    throw new DomainError('Informe seu nome completo (mínimo 2 caracteres).', 400);
+  }
+
+  try {
+    await ensureDefaultsSeeded();
+
+    if (emailLower === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase()) {
+      return {
+        alreadyAuthorized: true,
+        message:
+          'Este e-mail já é o Administrador Principal do sistema. Clique em "Já tenho senha" ou "Continuar com conta Google" para entrar.',
+      };
+    }
+
+    const existingUser = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, emailLower))
+      .limit(1);
+
+    if (existingUser[0] && existingUser[0].active) {
+      return {
+        alreadyAuthorized: true,
+        message:
+          'Este e-mail já está autorizado! Use a aba "Primeiro Acesso" para criar sua senha ou clique em "Continuar com conta Google".',
+      };
+    }
+
+    const existingPending = await db
+      .select()
+      .from(accessRequests)
+      .where(and(eq(accessRequests.email, emailLower), eq(accessRequests.status, 'PENDENTE')))
+      .limit(1);
+
+    const nowFormatted = formatDateTimeNow();
+
+    if (existingPending[0]) {
+      const updated = await db
+        .update(accessRequests)
+        .set({
+          name: cleanName.slice(0, 120),
+          role: (params.role || '').trim().slice(0, 100),
+          department: (params.department || '').trim().slice(0, 100),
+          reason: (params.reason || '').trim().slice(0, 500),
+          date: nowFormatted,
+          updatedAt: new Date(),
+        })
+        .where(eq(accessRequests.id, existingPending[0].id))
+        .returning();
+
+      await syncAccessRequestToSupabase(updated[0]);
+      return {
+        request: mapAccessRequestRow(updated[0]),
+        message:
+          'Seu pedido de acesso foi atualizado e reenviado ao Administrador da QHS Engenharia! Assim que aprovado, você poderá entrar no aplicativo.',
+      };
+    }
+
+    const inserted = await db
+      .insert(accessRequests)
+      .values({
+        id: `acc-req-${Date.now()}`,
+        orgId: ORG_ID,
+        name: cleanName.slice(0, 120),
+        email: emailLower.slice(0, 200),
+        role: (params.role || '').trim().slice(0, 100),
+        department: (params.department || '').trim().slice(0, 100),
+        reason: (params.reason || '').trim().slice(0, 500),
+        date: nowFormatted,
+        status: 'PENDENTE',
+      })
+      .returning();
+
+    await syncAccessRequestToSupabase(inserted[0]);
+    return {
+      request: mapAccessRequestRow(inserted[0]),
+      message:
+        'Pedido enviado com sucesso ao Administrador! Aguarde a aprovação e tente entrar novamente.',
+    };
+  } catch (error) {
+    if (error instanceof DomainError) throw error;
+    console.error('Database query failed in createAccessRequestInDb:', error);
+    throw new Error('Falha ao registrar pedido de acesso no banco de dados.', { cause: error });
+  }
+}
+
+export async function approveAccessRequestInDb(params: {
+  requestId: string;
+  admin: User;
+  role?: string;
+  department?: string;
+  canDelete?: boolean;
+  permissions?: Partial<UserPermissions>;
+}) {
+  try {
+    const result = await db.transaction(async (tx) => {
+      const reqRows = await tx
+        .select()
+        .from(accessRequests)
+        .where(eq(accessRequests.id, params.requestId))
+        .limit(1);
+
+      const reqRow = reqRows[0];
+      if (!reqRow) {
+        throw new DomainError('Pedido de acesso não encontrado.', 404);
+      }
+      if (reqRow.status !== 'PENDENTE') {
+        throw new DomainError('Este pedido de acesso já foi analisado.', 400);
+      }
+
+      const emailLower = reqRow.email.trim().toLowerCase();
+      const defaultPerms = normalizePermissions(
+        params.permissions ?? {
+          dashboard: true,
+          produtos: true,
+          entradas: false,
+          saidas: true,
+          colaboradores: true,
+          relatorios: false,
+          estatisticas: false,
+          configuracoes: false,
+        }
+      );
+
+      const resolvedRole = (params.role ?? reqRow.role) || 'Operador de Estoque';
+      const resolvedDepartment = params.department ?? reqRow.department ?? '';
+
+      const existingUsers = await tx
+        .select()
+        .from(users)
+        .where(eq(users.email, emailLower))
+        .limit(1);
+
+      let userRow: typeof users.$inferSelect;
+      if (existingUsers[0]) {
+        const updatedUsers = await tx
+          .update(users)
+          .set({
+            name: reqRow.name.trim().slice(0, 120),
+            role: resolvedRole.trim().slice(0, 100),
+            department: resolvedDepartment.trim().slice(0, 100),
+            canDelete: Boolean(existingUsers[0].isAdmin || params.canDelete),
+            active: true,
+            permissions: existingUsers[0].isAdmin ? FULL_ADMIN_PERMISSIONS : defaultPerms,
+            updatedAt: new Date(),
+          })
+          .where(eq(users.id, existingUsers[0].id))
+          .returning();
+        userRow = updatedUsers[0];
+      } else {
+        const insertedUsers = await tx
+          .insert(users)
+          .values({
+            id: `user-${Date.now()}`,
+            name: reqRow.name.trim().slice(0, 120),
+            email: emailLower.slice(0, 200),
+            role: resolvedRole.trim().slice(0, 100),
+            department: resolvedDepartment.trim().slice(0, 100),
+            isAdmin: false,
+            canDelete: Boolean(params.canDelete),
+            active: true,
+            permissions: defaultPerms,
+            registrationDate: formatDateToday(),
+          })
+          .returning();
+        userRow = insertedUsers[0];
+      }
+
+      const updatedReqs = await tx
+        .update(accessRequests)
+        .set({
+          status: 'APROVADO',
+          reviewedBy: params.admin.name.slice(0, 120),
+          reviewedAt: formatDateTimeNow(),
+          updatedAt: new Date(),
+        })
+        .where(eq(accessRequests.id, params.requestId))
+        .returning();
+
+      return { userRow, reqRow: updatedReqs[0] };
+    });
+
+    await syncUserToSupabase(result.userRow);
+    await syncAccessRequestToSupabase(result.reqRow);
+
+    return {
+      user: mapUserRow(result.userRow),
+      request: mapAccessRequestRow(result.reqRow),
+    };
+  } catch (error) {
+    if (error instanceof DomainError) throw error;
+    console.error('Database query failed in approveAccessRequestInDb:', error);
+    throw new Error('Falha ao aprovar pedido de acesso.', { cause: error });
+  }
+}
+
+export async function rejectAccessRequestInDb(params: { requestId: string; admin: User }) {
+  try {
+    const reqRows = await db
+      .select()
+      .from(accessRequests)
+      .where(eq(accessRequests.id, params.requestId))
+      .limit(1);
+
+    const reqRow = reqRows[0];
+    if (!reqRow) {
+      throw new DomainError('Pedido de acesso não encontrado.', 404);
+    }
+    if (reqRow.status !== 'PENDENTE') {
+      throw new DomainError('Este pedido de acesso já foi analisado.', 400);
+    }
+
+    const updated = await db
+      .update(accessRequests)
+      .set({
+        status: 'RECUSADO',
+        reviewedBy: params.admin.name.slice(0, 120),
+        reviewedAt: formatDateTimeNow(),
+        updatedAt: new Date(),
+      })
+      .where(eq(accessRequests.id, params.requestId))
+      .returning();
+
+    await syncAccessRequestToSupabase(updated[0]);
+    return mapAccessRequestRow(updated[0]);
+  } catch (error) {
+    if (error instanceof DomainError) throw error;
+    console.error('Database query failed in rejectAccessRequestInDb:', error);
+    throw new Error('Falha ao recusar pedido de acesso.', { cause: error });
   }
 }
 
@@ -1852,6 +2165,7 @@ export async function resetAllDataInDb(adminUid: string, adminEmail: string, adm
       await tx.delete(negativeRequests);
       await tx.delete(deletionRequests);
       await tx.delete(deletionLogs);
+      await tx.delete(accessRequests);
       await tx.delete(collaborators);
       await tx.delete(products);
       await tx.delete(users).where(sql`${users.id} <> 'user-owner'`);

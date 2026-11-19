@@ -84,7 +84,15 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen = false, onCloseMob
     setActiveTab,
     canAccessTab,
     currentUser,
+    pendingAccessRequestsCount,
+    pendingDeletionRequestsCount,
+    pendingNegativeRequestsCount,
   } = useApp();
+
+  const totalAdminPending =
+    pendingAccessRequestsCount +
+    pendingDeletionRequestsCount +
+    pendingNegativeRequestsCount;
 
   // Filtrar apenas as abas autorizadas para o usuário logado
   const allowedNavItems = ALL_NAV_ITEMS.filter((item) =>
@@ -137,6 +145,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen = false, onCloseMob
             {allowedNavItems.map((item) => {
               const Icon = item.icon;
               const isActive = activeTab === item.id;
+              const showBadge =
+                item.id === 'configuracoes' && currentUser.isAdmin && totalAdminPending > 0;
 
               return (
                 <button
@@ -158,6 +168,15 @@ export const Sidebar: React.FC<SidebarProps> = ({ mobileOpen = false, onCloseMob
                     />
                     <span className="truncate">{item.label}</span>
                   </div>
+                  {showBadge && (
+                    <span
+                      className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
+                        isActive ? 'bg-white text-red-600' : 'bg-red-600 text-white'
+                      }`}
+                    >
+                      {totalAdminPending}
+                    </span>
+                  )}
                 </button>
               );
             })}

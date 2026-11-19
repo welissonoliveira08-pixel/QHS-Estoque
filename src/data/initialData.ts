@@ -1,4 +1,11 @@
-import { ManagedLists, NegativeStockRequest, Product, StockMovement, SystemSettings, User } from '../types';
+import type {
+  ManagedLists,
+  NegativeStockRequest,
+  Product,
+  StockMovement,
+  SystemSettings,
+  User,
+} from '../types/index.ts';
 
 export const INITIAL_SETTINGS: SystemSettings = {
   showProductPhotos: true,

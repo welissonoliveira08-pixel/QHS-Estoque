@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { SettingsSubTab, useApp } from '../../context/AppContext';
-import { DeletionRecordType, TabId, User, UserPermissions } from '../../types';
+import { AccessRequest, DeletionRecordType, TabId, User, UserPermissions } from '../../types';
 import { DeletionActionModal, DeletionTarget } from '../DeletionActionModal';
 import {
   Settings,
@@ -29,6 +29,9 @@ import {
   Users,
   Copy,
   Mail,
+  Send,
+  Share2,
+  ExternalLink,
 } from 'lucide-react';
 
 const TAB_CONFIGS: { id: TabId; label: string; desc: string }[] = [
@@ -98,6 +101,10 @@ export const SettingsTab: React.FC = () => {
     createDeletionRequest,
     approveDeletionRequest,
     rejectDeletionRequest,
+    accessRequests,
+    pendingAccessRequestsCount,
+    approveAccessRequest,
+    rejectAccessRequest,
     settingsInitialSubTab,
     setSettingsInitialSubTab,
   } = useApp();
@@ -181,6 +188,23 @@ export const SettingsTab: React.FC = () => {
       configuracoes: false,
     } as UserPermissions,
   });
+
+  // Invite Modal State
+  const [inviteModalUser, setInviteModalUser] = useState<User | null>(null);
+  const [inviteBaseUrl, setInviteBaseUrl] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    const saved = window.localStorage.getItem('qhs_public_app_url');
+    if (saved) return saved;
+    const origin = window.location.origin;
+    if (origin.includes('://ais-dev-')) {
+      return origin.replace('://ais-dev-', '://ais-pre-');
+    }
+    return origin;
+  });
+
+  // Access Requests Processing State
+  const [processingAccessReqId, setProcessingAccessReqId] = useState<string | null>(null);
+  const [accessReqCanDeleteMap, setAccessReqCanDeleteMap] = useState<Record<string, boolean>>({});
 
   const sortedAndFilteredDeletionRequests = useMemo(() => {
     const filtered =
@@ -468,18 +492,60 @@ export const SettingsTab: React.FC = () => {
     setIsAddUserModalOpen(true);
   };
 
-  const buildUserInviteText = (name: string, email: string) => {
-    const appUrl = typeof window !== 'undefined' ? window.location.origin : '';
-    return `Olá, ${name}!\n\nSeu acesso ao Sistema de Estoque da QHS Engenharia foi liberado para o e-mail: ${email}\n\nPara entrar pela primeira vez:\n1. Acesse: ${appUrl}\n2. Clique na aba "Primeiro Acesso"\n3. Informe seu e-mail (${email}) e crie sua senha\n4. Confirme o link enviado para o seu e-mail e faça login.`;
+  const copyTextSafely = async (text: string): Promise<boolean> => {
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      // Fallback below for iOS Safari / restricted iframes
+    }
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.top = '-9999px';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      textarea.setSelectionRange(0, text.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return ok;
+    } catch {
+      return false;
+    }
   };
 
-  const handleCopyUserInvite = async (user: User) => {
-    const text = buildUserInviteText(user.name, user.email);
-    try {
-      await navigator.clipboard.writeText(text);
-      showNotice(`Convite de primeiro acesso copiado para ${user.email}!`);
-    } catch {
-      showNotice('Não foi possível copiar automaticamente. Envie pelo botão de e-mail.', true);
+  const getNormalizedInviteBaseUrl = () => {
+    const cleaned = inviteBaseUrl.trim().replace(/\/+$/, '');
+    if (cleaned.startsWith('http://') || cleaned.startsWith('https://')) {
+      return cleaned;
+    }
+    if (typeof window !== 'undefined') {
+      return window.location.origin;
+    }
+    return '';
+  };
+
+  const buildDirectInviteLink = (email: string) => {
+    const base = getNormalizedInviteBaseUrl();
+    return `${base}/?convite=${encodeURIComponent(email.trim().toLowerCase())}`;
+  };
+
+  const buildUserInviteText = (name: string, email: string) => {
+    const directUrl = buildDirectInviteLink(email);
+    return `Olá, ${name}!\n\nSeu acesso ao Sistema de Estoque da QHS Engenharia foi liberado para o e-mail: ${email}\n\nPara entrar:\n1. Abra o link: ${directUrl}\n2. Crie sua senha na aba "1º Acesso" (ou clique em "Continuar com conta Google")\n3. Confirme seu e-mail e acesse o sistema.`;
+  };
+
+  const handleOpenInviteModal = async (user: User) => {
+    setInviteModalUser(user);
+    const copied = await copyTextSafely(buildDirectInviteLink(user.email));
+    if (copied) {
+      showNotice(`Link de convite de ${user.email} copiado! Escolha abaixo como enviar.`);
     }
   };
 
@@ -487,6 +553,39 @@ export const SettingsTab: React.FC = () => {
     const subject = encodeURIComponent('Convite de Acesso - Sistema de Estoque QHS Engenharia');
     const body = encodeURIComponent(buildUserInviteText(user.name, user.email));
     return `mailto:${user.email}?subject=${subject}&body=${body}`;
+  };
+
+  const buildWhatsAppHref = (user: User) => {
+    const text = encodeURIComponent(buildUserInviteText(user.name, user.email));
+    return `https://wa.me/?text=${text}`;
+  };
+
+  const pendingAccessRequests = useMemo(
+    () => accessRequests.filter((r) => r.status === 'PENDENTE'),
+    [accessRequests]
+  );
+
+  const handleApproveAccessRequest = async (req: AccessRequest) => {
+    if (!isPrincipalAdminMode || processingAccessReqId) return;
+    setProcessingAccessReqId(req.id);
+    const canDelete = Boolean(accessReqCanDeleteMap[req.id]);
+    try {
+      const res = await approveAccessRequest(req.id, { canDelete });
+      showNotice(res.message || 'Pedido aprovado!', !res.success);
+    } finally {
+      setProcessingAccessReqId(null);
+    }
+  };
+
+  const handleRejectAccessRequest = async (req: AccessRequest) => {
+    if (!isPrincipalAdminMode || processingAccessReqId) return;
+    setProcessingAccessReqId(req.id);
+    try {
+      const res = await rejectAccessRequest(req.id);
+      showNotice(res.message || 'Pedido recusado.', !res.success);
+    } finally {
+      setProcessingAccessReqId(null);
+    }
   };
 
   const handleSaveEmployee = (e: React.FormEvent) => {
@@ -602,6 +701,11 @@ export const SettingsTab: React.FC = () => {
             >
               <ListPlus className="w-4 h-4 text-red-600" />
               <span>Gerenciamento de Listas & Cadastros</span>
+              {pendingAccessRequestsCount > 0 && (
+                <span className="inline-flex items-center px-1.5 py-0.5 rounded-full bg-red-600 text-white text-[10px] font-bold">
+                  {pendingAccessRequestsCount}
+                </span>
+              )}
             </button>
 
             <button
@@ -1336,6 +1440,90 @@ export const SettingsTab: React.FC = () => {
               )}
             </div>
 
+            {/* 4B. PEDIDOS DE ENTRADA NO APLICATIVO (SOLICITAÇÕES DE ACESSO) */}
+            {pendingAccessRequests.length > 0 && (
+              <div className="p-3.5 sm:p-5 bg-amber-50/70 border border-amber-300 rounded-xl space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
+                      <Send className="w-4 h-4 text-red-600 shrink-0" />
+                      Pedidos de Acesso ao Aplicativo ({pendingAccessRequests.length} pendente{pendingAccessRequests.length === 1 ? '' : 's'})
+                    </h3>
+                    <span className="text-xs text-zinc-600">
+                      Pessoas que solicitaram entrada pelo aplicativo. Aprove para liberar login imediato e sincronizar com o Supabase.
+                    </span>
+                  </div>
+                </div>
+
+                <div className="space-y-2.5">
+                  {pendingAccessRequests.map((req) => {
+                    const isProc = processingAccessReqId === req.id;
+                    return (
+                      <div
+                        key={req.id}
+                        className="bg-white p-3.5 rounded-lg border border-amber-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3 text-xs"
+                      >
+                        <div className="space-y-1 min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <strong className="text-sm text-zinc-900">{req.name}</strong>
+                            <span className="font-mono text-[11px] bg-zinc-100 px-2 py-0.5 rounded border border-zinc-200 text-zinc-700 break-all">
+                              {req.email}
+                            </span>
+                            <span className="text-[10px] font-mono text-zinc-500">{req.date}</span>
+                          </div>
+                          {(req.role || req.department) && (
+                            <div className="text-[11px] text-zinc-600">
+                              {req.role ? `Cargo: ${req.role}` : ''}
+                              {req.role && req.department ? ' · ' : ''}
+                              {req.department ? `Obra/Setor: ${req.department}` : ''}
+                            </div>
+                          )}
+                          {req.reason && (
+                            <div className="text-[11px] text-zinc-600 italic">
+                              "{req.reason}"
+                            </div>
+                          )}
+                          <label className="inline-flex items-center gap-1.5 pt-1 text-[11px] text-zinc-700 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(accessReqCanDeleteMap[req.id])}
+                              onChange={(e) =>
+                                setAccessReqCanDeleteMap((prev) => ({
+                                  ...prev,
+                                  [req.id]: e.target.checked,
+                                }))
+                              }
+                              className="rounded border-zinc-300 text-red-600"
+                            />
+                            <span>Permitir exclusão direta de registros</span>
+                          </label>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            disabled={isProc}
+                            onClick={() => void handleApproveAccessRequest(req)}
+                            className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition-colors"
+                          >
+                            {isProc ? 'Liberando...' : 'Aprovar e Liberar Acesso'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isProc}
+                            onClick={() => void handleRejectAccessRequest(req)}
+                            className="px-3 py-2 bg-zinc-200 hover:bg-zinc-300 disabled:opacity-50 text-zinc-800 rounded-lg text-xs font-semibold transition-colors"
+                          >
+                            Recusar
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             {/* 5. USUÁRIOS DO SISTEMA (ACESSO AO APLICATIVO & PERMISSÕES) */}
             <div className="p-3.5 sm:p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1384,19 +1572,13 @@ export const SettingsTab: React.FC = () => {
                       <div className="flex items-center gap-1 shrink-0">
                         <button
                           type="button"
-                          onClick={() => handleCopyUserInvite(user)}
-                          className="p-1.5 text-zinc-500 hover:text-zinc-900 hover:bg-zinc-100 rounded"
-                          title="Copiar convite de primeiro acesso"
+                          onClick={() => void handleOpenInviteModal(user)}
+                          className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded"
+                          title="Enviar link de convite"
                         >
-                          <Copy className="w-3.5 h-3.5" />
+                          <Send className="w-3 h-3" />
+                          Convite
                         </button>
-                        <a
-                          href={buildMailtoHref(user)}
-                          className="p-1.5 text-zinc-500 hover:text-red-600 hover:bg-red-50 rounded"
-                          title="Enviar convite por e-mail"
-                        >
-                          <Mail className="w-3.5 h-3.5" />
-                        </a>
                         <button
                           onClick={() => handleOpenEditEmployee(user)}
                           className="p-1.5 text-zinc-500 hover:text-zinc-800 hover:bg-zinc-100 rounded"
@@ -1487,20 +1669,13 @@ export const SettingsTab: React.FC = () => {
                           <div className="flex items-center justify-end gap-1.5">
                             <button
                               type="button"
-                              onClick={() => handleCopyUserInvite(user)}
-                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-zinc-700 bg-zinc-100 hover:bg-zinc-200 rounded transition-colors"
-                              title="Copiar instruções de primeiro acesso para enviar ao usuário"
+                              onClick={() => void handleOpenInviteModal(user)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded transition-colors"
+                              title="Enviar link de convite por WhatsApp, E-mail ou Cópia"
                             >
-                              <Copy className="w-3 h-3" />
-                              Convite
+                              <Send className="w-3 h-3" />
+                              Enviar Convite
                             </button>
-                            <a
-                              href={buildMailtoHref(user)}
-                              className="p-1 text-zinc-500 hover:text-red-600 hover:bg-red-50 rounded"
-                              title={`Abrir e-mail para ${user.email}`}
-                            >
-                              <Mail className="w-3.5 h-3.5" />
-                            </a>
                             <button
                               onClick={() => handleOpenEditEmployee(user)}
                               className="p-1 text-zinc-500 hover:text-zinc-800 hover:bg-zinc-100 rounded"
@@ -2698,6 +2873,160 @@ export const SettingsTab: React.FC = () => {
           }
         }}
       />
+
+      {/* Modal: Enviar Link de Convite */}
+      {inviteModalUser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/70 backdrop-blur-xs">
+          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[92vh] overflow-y-auto border border-zinc-200">
+            <div className="sticky top-0 z-10 flex items-center justify-between px-4 sm:px-5 py-3.5 bg-zinc-900 text-white border-b border-zinc-800">
+              <div className="flex items-center gap-2 min-w-0">
+                <Send className="w-4 h-4 text-red-500 shrink-0" />
+                <h3 className="text-sm font-bold truncate">
+                  Enviar Convite para {inviteModalUser.name}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setInviteModalUser(null)}
+                className="text-zinc-400 hover:text-white p-1"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 sm:p-5 space-y-4 text-xs">
+              <div className="bg-zinc-50 border border-zinc-200 rounded-lg p-3 space-y-1">
+                <div className="text-[11px] text-zinc-500">E-mail autorizado:</div>
+                <div className="font-mono font-bold text-zinc-900 break-all">
+                  {inviteModalUser.email}
+                </div>
+              </div>
+
+              {typeof window !== 'undefined' &&
+                window.location.hostname.startsWith('ais-dev-') && (
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-[11px] text-amber-900 leading-relaxed">
+                    <strong>Dica importante:</strong> você está na tela de edição (<span className="font-mono">ais-dev-...</span>). Já ajustamos o link abaixo para o endereço público compartilhado (<span className="font-mono">ais-pre-...</span>). Se quiser usar outro endereço publicado, altere no campo abaixo.
+                  </div>
+                )}
+
+              <div>
+                <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
+                  Endereço Base do Aplicativo Publicado
+                </label>
+                <input
+                  type="url"
+                  value={inviteBaseUrl}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setInviteBaseUrl(val);
+                    if (typeof window !== 'undefined' && val.trim().startsWith('http')) {
+                      window.localStorage.setItem('qhs_public_app_url', val.trim());
+                    }
+                  }}
+                  placeholder="https://..."
+                  className="w-full px-3 py-2 text-xs font-mono border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
+                  Link Direto de Primeiro Acesso (toque para selecionar ou copie abaixo)
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    readOnly
+                    onFocus={(e) => e.currentTarget.select()}
+                    value={buildDirectInviteLink(inviteModalUser.email)}
+                    className="flex-1 px-3 py-2 text-xs font-mono bg-zinc-50 border border-zinc-300 rounded-lg text-zinc-800"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const ok = await copyTextSafely(buildDirectInviteLink(inviteModalUser.email));
+                      showNotice(
+                        ok
+                          ? 'Link direto copiado com sucesso!'
+                          : 'Selecione o campo do link acima e copie manualmente.',
+                        !ok
+                      );
+                    }}
+                    className="px-3 py-2 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 shrink-0"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    Copiar Link
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
+                  Mensagem Pronta para Enviar
+                </label>
+                <textarea
+                  readOnly
+                  rows={5}
+                  onFocus={(e) => e.currentTarget.select()}
+                  value={buildUserInviteText(inviteModalUser.name, inviteModalUser.email)}
+                  className="w-full px-3 py-2 text-xs bg-zinc-50 border border-zinc-300 rounded-lg text-zinc-700 leading-relaxed"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                <a
+                  href={buildWhatsAppHref(inviteModalUser)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition-colors"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  Enviar por WhatsApp
+                </a>
+
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const text = buildUserInviteText(inviteModalUser.name, inviteModalUser.email);
+                    const url = buildDirectInviteLink(inviteModalUser.email);
+                    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+                      try {
+                        await navigator.share({
+                          title: 'Convite QHS Engenharia',
+                          text,
+                          url,
+                        });
+                        showNotice('Convite compartilhado com sucesso!');
+                        return;
+                      } catch {
+                        // Fall through to copy
+                      }
+                    }
+                    const ok = await copyTextSafely(text);
+                    showNotice(
+                      ok
+                        ? 'Mensagem completa com link copiada!'
+                        : 'Use os botões WhatsApp/E-mail ou selecione o texto acima.',
+                      !ok
+                    );
+                  }}
+                  className="flex items-center justify-center gap-2 px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-bold transition-colors"
+                >
+                  <Share2 className="w-4 h-4" />
+                  Compartilhar / Copiar Mensagem
+                </button>
+
+                <a
+                  href={buildMailtoHref(inviteModalUser)}
+                  className="sm:col-span-2 flex items-center justify-center gap-2 px-4 py-2 bg-zinc-100 hover:bg-zinc-200 text-zinc-800 rounded-lg text-xs font-semibold transition-colors"
+                >
+                  <Mail className="w-4 h-4" />
+                  Abrir no Aplicativo de E-mail
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import {
   AlertTriangle,
@@ -12,11 +12,13 @@ import {
   Mail,
   MailCheck,
   RefreshCw,
+  Send,
   ShieldCheck,
   UserPlus,
+  WifiOff,
 } from 'lucide-react';
 
-type AuthMode = 'login' | 'first_access' | 'reset';
+type AuthMode = 'login' | 'first_access' | 'request_access' | 'reset';
 
 export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const {
@@ -30,6 +32,8 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
     sendPasswordReset,
     signInWithGoogle,
     signOutGoogle,
+    retryBootstrap,
+    submitAccessRequest,
   } = useApp();
 
   const [mode, setMode] = useState<AuthMode>('login');
@@ -37,9 +41,41 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+
+  // Access request form fields (for both login 'request_access' mode & 'unauthorized' screen)
+  const [reqName, setReqName] = useState('');
+  const [reqRole, setReqRole] = useState('');
+  const [reqDepartment, setReqDepartment] = useState('');
+  const [reqReason, setReqReason] = useState('');
+  const [reqSentMessage, setReqSentMessage] = useState<string | null>(null);
+
   const [submitting, setSubmitting] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [localSuccess, setLocalSuccess] = useState<string | null>(null);
+
+  // Support direct invite link: ?convite=email@empresa.com
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const inviteEmail = (params.get('convite') || params.get('invite') || '').trim();
+    const requestFlag = params.get('solicitar');
+    if (inviteEmail) {
+      setEmail(inviteEmail);
+      setMode('first_access');
+    } else if (requestFlag === '1') {
+      setMode('request_access');
+    }
+  }, []);
+
+  // Pre-fill request name from Google/Firebase displayName if unauthorized
+  useEffect(() => {
+    if (accessStatus === 'unauthorized' && firebaseUser) {
+      setReqName((prev) => prev || firebaseUser.displayName || '');
+      setReqSentMessage(null);
+      setLocalError(null);
+    }
+  }, [accessStatus, firebaseUser]);
 
   if (accessStatus === 'ready') {
     return <>{children}</>;
@@ -172,7 +208,13 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
     );
   }
 
-  if (accessStatus === 'unauthorized') {
+  if (accessStatus === 'server_error') {
+    const handleRetry = async () => {
+      setRetrying(true);
+      await retryBootstrap();
+      setRetrying(false);
+    };
+
     return (
       <div className="min-h-screen bg-zinc-950 flex items-center justify-center p-4">
         <div className="max-w-md w-full bg-white rounded-2xl shadow-2xl border border-zinc-200 overflow-hidden">
@@ -188,36 +230,244 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
             </div>
           </div>
 
-          <div className="p-6 space-y-5 text-center">
-            <div className="w-14 h-14 bg-red-50 border border-red-200 rounded-full flex items-center justify-center mx-auto text-red-600">
-              <Lock className="w-7 h-7" />
+          <div className="p-6 space-y-4 text-center">
+            <div className="w-14 h-14 bg-amber-50 border border-amber-200 rounded-full flex items-center justify-center mx-auto text-amber-600">
+              <WifiOff className="w-7 h-7" />
             </div>
 
             <div>
-              <h2 className="text-lg font-bold text-zinc-900">Acesso Não Autorizado</h2>
+              <h2 className="text-lg font-bold text-zinc-900">Servidor Indisponível</h2>
               <p className="text-xs text-zinc-600 mt-2 leading-relaxed">
-                {authError ||
-                  'Este e-mail não está vinculado a um usuário ativo na QHS Engenharia.'}
+                {authError || 'Não foi possível conectar ao servidor do aplicativo.'}
               </p>
             </div>
 
             {firebaseUser?.email && (
               <div className="bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-xs text-zinc-700 break-all">
+                Conta autenticada: <strong className="font-mono">{firebaseUser.email}</strong>
+              </div>
+            )}
+
+            <p className="text-[11px] text-zinc-500 leading-relaxed">
+              Se você acabou de atualizar ou publicar o aplicativo, aguarde alguns segundos e toque em <strong>Tentar Novamente</strong>. Caso o erro HTTP 404 persista, republique o aplicativo atualizado no AI Studio para ativar o servidor.
+            </p>
+
+            <div className="space-y-2.5 pt-1">
+              <button
+                type="button"
+                onClick={handleRetry}
+                disabled={retrying}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
+              >
+                {retrying ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-4 h-4" />
+                )}
+                Tentar Novamente
+              </button>
+
+              <button
+                type="button"
+                onClick={signOutGoogle}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+              >
+                <LogOut className="w-4 h-4" />
+                Sair e Trocar E-mail
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (accessStatus === 'unauthorized') {
+    const handleSendUnauthorizedRequest = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!firebaseUser?.email) return;
+      setLocalError(null);
+      setReqSentMessage(null);
+      setSubmitting(true);
+      const res = await submitAccessRequest({
+        name: reqName,
+        email: firebaseUser.email,
+        role: reqRole,
+        department: reqDepartment,
+        reason: reqReason,
+      });
+      setSubmitting(false);
+      if (res.success) {
+        setReqSentMessage(res.message);
+        if (res.alreadyAuthorized) {
+          await retryBootstrap();
+        }
+      } else {
+        setLocalError(res.message);
+      }
+    };
+
+    const handleCheckApproval = async () => {
+      setRetrying(true);
+      setLocalError(null);
+      const ok = await retryBootstrap();
+      setRetrying(false);
+      if (!ok && !reqSentMessage) {
+        setLocalError('Seu e-mail ainda aguarda aprovação do Administrador.');
+      }
+    };
+
+    return (
+      <div className="min-h-screen bg-zinc-950 flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-2xl shadow-2xl border border-zinc-200 overflow-hidden">
+          <div className="bg-zinc-900 px-6 py-5 flex items-center gap-3 border-b border-zinc-800">
+            <div className="w-10 h-10 bg-red-600 rounded-lg flex items-center justify-center text-white font-black text-sm border border-red-500">
+              QHS
+            </div>
+            <div>
+              <h1 className="text-sm font-extrabold text-white tracking-tight">
+                QHS <span className="text-red-500">ENGENHARIA</span>
+              </h1>
+              <p className="text-[11px] text-zinc-400">Almoxarifado & Materiais</p>
+            </div>
+          </div>
+
+          <div className="p-6 space-y-4">
+            <div className="text-center space-y-2">
+              <div className="w-12 h-12 bg-red-50 border border-red-200 rounded-full flex items-center justify-center mx-auto text-red-600">
+                <Lock className="w-6 h-6" />
+              </div>
+              <h2 className="text-lg font-bold text-zinc-900">Acesso Pendente de Liberação</h2>
+              <p className="text-xs text-zinc-600 leading-relaxed">
+                {authError ||
+                  'Este e-mail ainda não está cadastrado ou ativo na QHS Engenharia.'}
+              </p>
+            </div>
+
+            {firebaseUser?.email && (
+              <div className="bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-xs text-zinc-700 break-all text-center">
                 Conta conectada: <strong className="font-mono">{firebaseUser.email}</strong>
               </div>
             )}
 
-            <p className="text-[11px] text-zinc-500">
-              Solicite ao Administrador o cadastro e ativação do seu e-mail na aba Configurações.
-            </p>
+            {localError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2 text-xs text-red-800">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <span>{localError}</span>
+              </div>
+            )}
 
-            <button
-              onClick={signOutGoogle}
-              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold transition-colors cursor-pointer"
-            >
-              <LogOut className="w-4 h-4" />
-              Sair e Trocar E-mail
-            </button>
+            {reqSentMessage ? (
+              <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl space-y-2 text-xs text-emerald-900">
+                <div className="flex items-start gap-2 font-semibold">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span>{reqSentMessage}</span>
+                </div>
+              </div>
+            ) : (
+              <form
+                onSubmit={handleSendUnauthorizedRequest}
+                className="space-y-3 bg-zinc-50 border border-zinc-200 rounded-xl p-3.5 text-left"
+              >
+                <div className="text-xs font-bold text-zinc-900 flex items-center gap-1.5">
+                  <Send className="w-3.5 h-3.5 text-red-600" />
+                  Enviar Pedido para Entrar no Aplicativo
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
+                    Seu Nome Completo *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    minLength={2}
+                    value={reqName}
+                    onChange={(e) => setReqName(e.target.value)}
+                    placeholder="Ex: João Silva"
+                    className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
+                      Cargo / Função
+                    </label>
+                    <input
+                      type="text"
+                      value={reqRole}
+                      onChange={(e) => setReqRole(e.target.value)}
+                      placeholder="Ex: Almoxarife"
+                      className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
+                      Obra / Setor
+                    </label>
+                    <input
+                      type="text"
+                      value={reqDepartment}
+                      onChange={(e) => setReqDepartment(e.target.value)}
+                      placeholder="Ex: Obra Centro"
+                      className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
+                    Observação (opcional)
+                  </label>
+                  <input
+                    type="text"
+                    value={reqReason}
+                    onChange={(e) => setReqReason(e.target.value)}
+                    placeholder="Motivo ou solicitação para o Administrador"
+                    className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
+                >
+                  {submitting ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Send className="w-4 h-4" />
+                  )}
+                  Enviar Pedido de Acesso ao Administrador
+                </button>
+              </form>
+            )}
+
+            <div className="space-y-2 pt-1">
+              <button
+                type="button"
+                onClick={handleCheckApproval}
+                disabled={retrying}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-zinc-100 hover:bg-zinc-200 disabled:opacity-60 text-zinc-900 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+              >
+                {retrying ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-4 h-4" />
+                )}
+                Já fui aprovado — Entrar agora
+              </button>
+
+              <button
+                type="button"
+                onClick={signOutGoogle}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+              >
+                <LogOut className="w-4 h-4" />
+                Sair e Trocar E-mail
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -265,6 +515,27 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
       return;
     }
 
+    if (mode === 'request_access') {
+      setSubmitting(true);
+      const res = await submitAccessRequest({
+        name: reqName,
+        email,
+        role: reqRole,
+        department: reqDepartment,
+        reason: reqReason,
+      });
+      setSubmitting(false);
+      if (res.success) {
+        setLocalSuccess(res.message);
+        if (!res.alreadyAuthorized) {
+          setReqReason('');
+        }
+      } else {
+        setLocalError(res.message);
+      }
+      return;
+    }
+
     if (mode === 'reset') {
       setSubmitting(true);
       const res = await sendPasswordReset(email);
@@ -297,7 +568,7 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
           </div>
         </div>
 
-        <div className="p-6 sm:p-7 space-y-5">
+        <div className="p-5 sm:p-7 space-y-5">
           <div className="space-y-1.5">
             <div className="inline-flex items-center gap-1.5 text-[11px] font-bold text-red-600 uppercase tracking-wider">
               <ShieldCheck className="w-4 h-4" />
@@ -308,6 +579,8 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                 ? 'Entrar no Sistema'
                 : mode === 'first_access'
                 ? 'Primeiro Acesso com E-mail'
+                : mode === 'request_access'
+                ? 'Pedir Acesso ao Aplicativo'
                 : 'Definir ou Redefinir Senha'}
             </h2>
             <p className="text-xs text-zinc-600 leading-relaxed">
@@ -315,36 +588,50 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                 ? 'Entre com o e-mail autorizado pelo Administrador e sua senha.'
                 : mode === 'first_access'
                 ? 'Informe o e-mail liberado pelo Administrador e crie sua senha pessoal para o primeiro acesso.'
+                : mode === 'request_access'
+                ? 'Preencha seus dados para enviar uma solicitação de entrada ao Administrador da QHS Engenharia.'
                 : 'Informe seu e-mail autorizado para receber um link de criação ou redefinição de senha.'}
             </p>
           </div>
 
           {/* Mode Tabs */}
           {mode !== 'reset' && (
-            <div className="grid grid-cols-2 gap-1 p-1 bg-zinc-100 rounded-xl border border-zinc-200">
+            <div className="grid grid-cols-3 gap-1 p-1 bg-zinc-100 rounded-xl border border-zinc-200">
               <button
                 type="button"
                 onClick={() => switchMode('login')}
-                className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                className={`flex items-center justify-center gap-1 py-2 px-2 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
                   mode === 'login'
                     ? 'bg-white text-zinc-900 shadow-xs border border-zinc-200'
                     : 'text-zinc-500 hover:text-zinc-800'
                 }`}
               >
-                <Mail className="w-3.5 h-3.5" />
-                Já tenho senha
+                <Mail className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">Entrar</span>
               </button>
               <button
                 type="button"
                 onClick={() => switchMode('first_access')}
-                className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                className={`flex items-center justify-center gap-1 py-2 px-2 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
                   mode === 'first_access'
                     ? 'bg-white text-red-600 shadow-xs border border-zinc-200'
                     : 'text-zinc-500 hover:text-zinc-800'
                 }`}
               >
-                <UserPlus className="w-3.5 h-3.5" />
-                Primeiro Acesso
+                <UserPlus className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">1º Acesso</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => switchMode('request_access')}
+                className={`flex items-center justify-center gap-1 py-2 px-2 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
+                  mode === 'request_access'
+                    ? 'bg-white text-red-600 shadow-xs border border-zinc-200'
+                    : 'text-zinc-500 hover:text-zinc-800'
+                }`}
+              >
+                <Send className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">Pedir Acesso</span>
               </button>
             </div>
           )}
@@ -355,7 +642,19 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                 <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
                 <span>{displayedError}</span>
               </div>
-              {mode !== 'reset' && email.trim().includes('@') && (
+              {mode === 'first_access' &&
+                displayedError.toLowerCase().includes('não foi autorizado') && (
+                  <div className="pl-6 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => switchMode('request_access')}
+                      className="px-2.5 py-1 bg-red-600 hover:bg-red-700 text-white rounded-md text-[11px] font-bold transition-colors cursor-pointer"
+                    >
+                      Enviar pedido de acesso para este e-mail
+                    </button>
+                  </div>
+                )}
+              {mode === 'login' && email.trim().includes('@') && (
                 <div className="flex flex-wrap gap-2 pl-6 pt-1">
                   <button
                     type="button"
@@ -399,9 +698,26 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
           )}
 
           <form onSubmit={handleSubmit} className="space-y-3.5">
+            {mode === 'request_access' && (
+              <div>
+                <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                  Seu Nome Completo *
+                </label>
+                <input
+                  type="text"
+                  required
+                  minLength={2}
+                  value={reqName}
+                  onChange={(e) => setReqName(e.target.value)}
+                  placeholder="Ex: João Silva Santos"
+                  className="w-full px-3 py-2.5 text-xs border border-zinc-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600"
+                />
+              </div>
+            )}
+
             <div>
               <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                E-mail Autorizado
+                {mode === 'request_access' ? 'Seu E-mail *' : 'E-mail Autorizado'}
               </label>
               <div className="relative">
                 <Mail className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -417,7 +733,51 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
               </div>
             </div>
 
-            {mode !== 'reset' && (
+            {mode === 'request_access' && (
+              <>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                      Cargo / Função
+                    </label>
+                    <input
+                      type="text"
+                      value={reqRole}
+                      onChange={(e) => setReqRole(e.target.value)}
+                      placeholder="Ex: Almoxarife"
+                      className="w-full px-3 py-2.5 text-xs border border-zinc-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                      Obra / Departamento
+                    </label>
+                    <input
+                      type="text"
+                      value={reqDepartment}
+                      onChange={(e) => setReqDepartment(e.target.value)}
+                      placeholder="Ex: Obra Norte"
+                      className="w-full px-3 py-2.5 text-xs border border-zinc-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                    Observação para o Administrador
+                  </label>
+                  <input
+                    type="text"
+                    value={reqReason}
+                    onChange={(e) => setReqReason(e.target.value)}
+                    placeholder="Ex: Preciso lançar entradas e saídas da obra"
+                    className="w-full px-3 py-2.5 text-xs border border-zinc-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600"
+                  />
+                </div>
+              </>
+            )}
+
+            {(mode === 'login' || mode === 'first_access') && (
               <div>
                 <div className="flex items-center justify-between mb-1">
                   <label className="block text-xs font-semibold text-zinc-700">
@@ -496,8 +856,8 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                 <Loader2 className="w-4 h-4 animate-spin" />
               ) : mode === 'first_access' ? (
                 <UserPlus className="w-4 h-4" />
-              ) : mode === 'reset' ? (
-                <Mail className="w-4 h-4" />
+              ) : mode === 'request_access' ? (
+                <Send className="w-4 h-4" />
               ) : (
                 <Mail className="w-4 h-4" />
               )}
@@ -506,6 +866,8 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                   ? 'Entrar com E-mail'
                   : mode === 'first_access'
                   ? 'Ativar Primeiro Acesso'
+                  : mode === 'request_access'
+                  ? 'Enviar Pedido de Acesso'
                   : 'Enviar Link de Redefinição'}
               </span>
             </button>

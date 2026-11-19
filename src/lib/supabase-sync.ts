@@ -1,5 +1,6 @@
 import { db } from '../db/index.ts';
 import {
+  accessRequests,
   collaborators,
   deletionLogs,
   deletionRequests,
@@ -20,6 +21,7 @@ type DeletionRequestRow = typeof deletionRequests.$inferSelect;
 type DeletionLogRow = typeof deletionLogs.$inferSelect;
 type ManagedListsRow = typeof managedLists.$inferSelect;
 type SystemSettingsRow = typeof systemSettings.$inferSelect;
+type AccessRequestRow = typeof accessRequests.$inferSelect;
 
 interface SupabaseConfig {
   url: string;
@@ -326,6 +328,24 @@ function toSupabaseSystemSettings(row: SystemSettingsRow) {
   };
 }
 
+function toSupabaseAccessRequest(row: AccessRequestRow) {
+  return {
+    id: row.id,
+    org_id: row.orgId,
+    name: row.name,
+    email: row.email,
+    role: row.role,
+    department: row.department,
+    reason: row.reason,
+    date: row.date,
+    status: row.status,
+    reviewed_by: row.reviewedBy ?? null,
+    reviewed_at: row.reviewedAt ?? null,
+    created_at: toIso(row.createdAt),
+    updated_at: toIso(row.updatedAt),
+  };
+}
+
 function handleHttpFailure(
   config: SupabaseConfig,
   operation: 'Upsert' | 'Delete',
@@ -530,6 +550,64 @@ export async function syncSystemSettingsToSupabase(
   await upsertSupabaseRows('system_settings', [toSupabaseSystemSettings(row)]);
 }
 
+export async function syncAccessRequestToSupabase(
+  row: AccessRequestRow | undefined
+): Promise<void> {
+  if (!row) return;
+  await upsertSupabaseRows('access_requests', [toSupabaseAccessRequest(row)]);
+}
+
+export interface RemotePendingAccessRequest {
+  id: string;
+  orgId: string;
+  name: string;
+  email: string;
+  role: string;
+  department: string;
+  reason: string;
+  date: string;
+  status: string;
+}
+
+export async function pullPendingAccessRequestsFromSupabase(): Promise<RemotePendingAccessRequest[]> {
+  const config = ensureWritableConfig();
+  if (!config) return [];
+
+  try {
+    const response = await fetch(
+      `${config.url}/rest/v1/access_requests?status=eq.PENDENTE&select=id,org_id,name,email,role,department,reason,date,status`,
+      {
+        method: 'GET',
+        headers: buildHeaders(config.key),
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const rows = (await response.json().catch(() => [])) as Array<Record<string, unknown>>;
+    if (!Array.isArray(rows)) return [];
+
+    return rows
+      .filter((r) => typeof r.id === 'string' && typeof r.email === 'string' && typeof r.name === 'string')
+      .map((r) => ({
+        id: String(r.id),
+        orgId: typeof r.org_id === 'string' ? r.org_id : 'qhs-engenharia',
+        name: String(r.name),
+        email: String(r.email).trim().toLowerCase(),
+        role: typeof r.role === 'string' ? r.role : '',
+        department: typeof r.department === 'string' ? r.department : '',
+        reason: typeof r.reason === 'string' ? r.reason : '',
+        date: typeof r.date === 'string' ? r.date : '',
+        status: typeof r.status === 'string' ? r.status : 'PENDENTE',
+      }));
+  } catch {
+    return [];
+  }
+}
+
 export async function syncAllTablesToSupabase(): Promise<boolean> {
   const config = ensureWritableConfig();
   if (!config) return false;
@@ -545,6 +623,7 @@ export async function syncAllTablesToSupabase(): Promise<boolean> {
       negRows,
       delReqRows,
       delLogRows,
+      accessReqRows,
     ] = await Promise.all([
       db.select().from(systemSettings),
       db.select().from(managedLists),
@@ -555,6 +634,7 @@ export async function syncAllTablesToSupabase(): Promise<boolean> {
       db.select().from(negativeRequests),
       db.select().from(deletionRequests),
       db.select().from(deletionLogs),
+      db.select().from(accessRequests),
     ]);
 
     const probeOk = await upsertSupabaseRows(
@@ -582,6 +662,9 @@ export async function syncAllTablesToSupabase(): Promise<boolean> {
       upsertSupabaseRows('deletion_requests', delReqRows.map(toSupabaseDeletionRequest)),
       upsertSupabaseRows('deletion_logs', delLogRows.map(toSupabaseDeletionLog)),
     ]);
+
+    // Sync access_requests without blocking core 9 tables if user hasn't run updated DDL yet
+    await upsertSupabaseRows('access_requests', accessReqRows.map(toSupabaseAccessRequest));
 
     return childResults.every(Boolean);
   } catch (error) {
@@ -627,6 +710,7 @@ export async function syncResetAllToSupabase(params: {
   await deleteSupabaseWhere('negative_requests', 'id=not.is.null');
   await deleteSupabaseWhere('deletion_requests', 'id=not.is.null');
   await deleteSupabaseWhere('deletion_logs', 'id=not.is.null');
+  await deleteSupabaseWhere('access_requests', 'id=not.is.null');
   await deleteSupabaseWhere('collaborators', 'id=not.is.null');
   await deleteSupabaseWhere('products', 'id=not.is.null');
   await deleteSupabaseWhere('users', 'id=neq.user-owner');

@@ -161,3 +161,18 @@ export interface SystemSettings {
   contactEmail: string;
   lowStockAlertNotification: boolean;
 }
+
+export type AccessRequestStatus = 'PENDENTE' | 'APROVADO' | 'RECUSADO';
+
+export interface AccessRequest {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  department: string;
+  reason: string;
+  date: string;
+  status: AccessRequestStatus;
+  reviewedBy?: string;
+  reviewedAt?: string;
+}

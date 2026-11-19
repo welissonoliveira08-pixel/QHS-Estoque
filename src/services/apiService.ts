@@ -1,5 +1,6 @@
 import { auth } from '../firebase';
 import type {
+  AccessRequest,
   Collaborator,
   DeletionLog,
   DeletionRecordType,
@@ -22,6 +23,7 @@ export interface BootstrapResponse {
   negativeRequests: NegativeStockRequest[];
   deletionRequests: DeletionRequest[];
   deletionLogs: DeletionLog[];
+  accessRequests: AccessRequest[];
   managedLists: ManagedLists;
   settings: SystemSettings;
 }
@@ -79,16 +81,57 @@ export async function verifyEmailInviteApi(email: string): Promise<{
     body: JSON.stringify({ email }),
   });
 
-  const payload = await response.json().catch(() => ({}));
+  const contentType = response.headers.get('content-type') || '';
+  const payload = contentType.includes('application/json')
+    ? await response.json().catch(() => ({}))
+    : {};
   if (!response.ok) {
     throw new ApiError(
       typeof payload?.error === 'string' && payload.error.trim()
         ? payload.error
+        : response.status === 404
+        ? 'Servidor da API indisponível (HTTP 404). Verifique se o servidor do aplicativo foi publicado/iniciado.'
         : 'Este e-mail não está autorizado a acessar o sistema.',
       response.status
     );
   }
   return payload as { authorized: boolean; alreadyActivated: boolean };
+}
+
+export async function requestAccessApi(params: {
+  name: string;
+  email: string;
+  role?: string;
+  department?: string;
+  reason?: string;
+}): Promise<{
+  request?: AccessRequest;
+  alreadyAuthorized?: boolean;
+  message: string;
+}> {
+  const response = await fetch('/api/auth/request-access', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+
+  const contentType = response.headers.get('content-type') || '';
+  const payload = contentType.includes('application/json')
+    ? await response.json().catch(() => ({}))
+    : {};
+  if (!response.ok) {
+    throw new ApiError(
+      typeof payload?.error === 'string' && payload.error.trim()
+        ? payload.error
+        : `Erro HTTP ${response.status} ao enviar solicitação de acesso ao servidor.`,
+      response.status
+    );
+  }
+  return payload as {
+    request?: AccessRequest;
+    alreadyAuthorized?: boolean;
+    message: string;
+  };
 }
 
 export function fetchBootstrapData(): Promise<BootstrapResponse> {
@@ -157,6 +200,29 @@ export function updateUserDeletePermissionApi(
 export function deleteUserApi(userId: string): Promise<{ ok: boolean }> {
   return apiFetch(`/api/users/${encodeURIComponent(userId)}`, {
     method: 'DELETE',
+  });
+}
+
+export function approveAccessRequestApi(
+  requestId: string,
+  options?: {
+    role?: string;
+    department?: string;
+    canDelete?: boolean;
+    permissions?: Partial<UserPermissions>;
+  }
+): Promise<{ ok: boolean; user: User; request: AccessRequest }> {
+  return apiFetch(`/api/access-requests/${encodeURIComponent(requestId)}/approve`, {
+    method: 'POST',
+    body: JSON.stringify(options ?? {}),
+  });
+}
+
+export function rejectAccessRequestApi(
+  requestId: string
+): Promise<{ ok: boolean; request: AccessRequest }> {
+  return apiFetch(`/api/access-requests/${encodeURIComponent(requestId)}/reject`, {
+    method: 'POST',
   });
 }
 

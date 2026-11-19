@@ -177,6 +177,22 @@ export const systemSettings = pgTable('system_settings', {
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
 
+export const accessRequests = pgTable('access_requests', {
+  id: text('id').primaryKey(),
+  orgId: text('org_id').notNull().default('qhs-engenharia'),
+  name: text('name').notNull(),
+  email: text('email').notNull(),
+  role: text('role').notNull().default(''),
+  department: text('department').notNull().default(''),
+  reason: text('reason').notNull().default(''),
+  date: text('date').notNull(),
+  status: text('status').notNull().default('PENDENTE'),
+  reviewedBy: text('reviewed_by'),
+  reviewedAt: text('reviewed_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
 // Relations
 export const productsRelations = relations(products, ({ many }) => ({
   movements: many(movements),

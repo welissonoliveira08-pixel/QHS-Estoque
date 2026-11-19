@@ -5,9 +5,11 @@ import type { NextFunction, Request, Response } from 'express';
 import { requireAdmin, requireAuth, requireDirectDelete } from './src/middleware/auth.ts';
 import type { AuthRequest } from './src/middleware/auth.ts';
 import {
+  approveAccessRequestInDb,
   approveDeletionRequestInDb,
   approveNegativeRequestInDb,
   checkEmailInvitationStatus,
+  createAccessRequestInDb,
   createCollaboratorInDb,
   createDeletionRequestInDb,
   createNegativeRequestInDb,
@@ -21,6 +23,7 @@ import {
   DomainError,
   getBootstrapData,
   recordMovementInDb,
+  rejectAccessRequestInDb,
   rejectDeletionRequestInDb,
   rejectNegativeRequestInDb,
   resetAllDataInDb,
@@ -68,6 +71,21 @@ app.post(
       return;
     }
     res.json(status);
+  })
+);
+
+// Public access request ("Solicitar Acesso / Pedido para entrar no aplicativo")
+app.post(
+  '/api/auth/request-access',
+  asyncHandler(async (req, res) => {
+    const result = await createAccessRequestInDb({
+      name: String(req.body?.name ?? ''),
+      email: String(req.body?.email ?? ''),
+      role: req.body?.role ? String(req.body.role) : '',
+      department: req.body?.department ? String(req.body.department) : '',
+      reason: req.body?.reason ? String(req.body.reason) : '',
+    });
+    res.status(result.alreadyAuthorized ? 200 : 201).json(result);
   })
 );
 
@@ -170,6 +188,39 @@ app.delete(
     const id = String(req.params.id);
     await deleteUserInDb(id);
     res.json({ ok: true });
+  })
+);
+
+// App Access Requests (Approve / Reject by Admin)
+app.post(
+  '/api/access-requests/:id/approve',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const id = String(req.params.id);
+    const result = await approveAccessRequestInDb({
+      requestId: id,
+      admin: req.dbUser!,
+      role: req.body?.role ? String(req.body.role) : undefined,
+      department: req.body?.department ? String(req.body.department) : undefined,
+      canDelete: req.body?.canDelete !== undefined ? Boolean(req.body.canDelete) : undefined,
+      permissions: req.body?.permissions,
+    });
+    res.json({ ok: true, ...result });
+  })
+);
+
+app.post(
+  '/api/access-requests/:id/reject',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const id = String(req.params.id);
+    const updated = await rejectAccessRequestInDb({
+      requestId: id,
+      admin: req.dbUser!,
+    });
+    res.json({ ok: true, request: updated });
   })
 );
 
@@ -496,7 +547,11 @@ async function startServer() {
   } else {
     const distDir = path.resolve(import.meta.dirname, 'dist');
     app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
+    app.get('*', (req, res) => {
+      if (req.path.startsWith('/api')) {
+        res.status(404).json({ error: 'Rota de API não encontrada.' });
+        return;
+      }
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }

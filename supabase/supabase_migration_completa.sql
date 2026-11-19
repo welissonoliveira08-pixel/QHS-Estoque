@@ -168,6 +168,22 @@ CREATE TABLE IF NOT EXISTS "public"."system_settings" (
   "updated_at" timestamp NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS "public"."access_requests" (
+  "id" text PRIMARY KEY NOT NULL,
+  "org_id" text NOT NULL DEFAULT 'qhs-engenharia',
+  "name" text NOT NULL,
+  "email" text NOT NULL,
+  "role" text NOT NULL DEFAULT '',
+  "department" text NOT NULL DEFAULT '',
+  "reason" text NOT NULL DEFAULT '',
+  "date" text NOT NULL,
+  "status" text NOT NULL DEFAULT 'PENDENTE',
+  "reviewed_by" text,
+  "reviewed_at" text,
+  "created_at" timestamp NOT NULL DEFAULT now(),
+  "updated_at" timestamp NOT NULL DEFAULT now()
+);
+
 -- 2. CHAVES ESTRANGEIRAS (RELACIONAMENTOS)
 
 ALTER TABLE "public"."movements"
@@ -204,6 +220,8 @@ CREATE INDEX IF NOT EXISTS "idx_movements_product_id" ON "public"."movements" ("
 CREATE INDEX IF NOT EXISTS "idx_movements_collaborator_id" ON "public"."movements" ("collaborator_id");
 CREATE INDEX IF NOT EXISTS "idx_negative_requests_product_id" ON "public"."negative_requests" ("product_id");
 CREATE INDEX IF NOT EXISTS "idx_deletion_requests_status" ON "public"."deletion_requests" ("status");
+CREATE INDEX IF NOT EXISTS "idx_access_requests_status" ON "public"."access_requests" ("status");
+CREATE INDEX IF NOT EXISTS "idx_access_requests_email" ON "public"."access_requests" ("email");
 
 -- 4. PERMISSÕES PARA SINCRONIZAÇÃO BACKEND (SERVICE_ROLE)
 

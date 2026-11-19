@@ -11,18 +11,21 @@ import {
   User as FirebaseUser,
   EmailAuthProvider,
   createUserWithEmailAndPassword,
+  getRedirectResult,
   linkWithCredential,
   onAuthStateChanged,
   sendEmailVerification,
   sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signInWithPopup,
+  signInWithRedirect,
   signOut,
   updatePassword,
 } from 'firebase/auth';
 import { auth, BOOTSTRAPPED_ADMIN_EMAIL, googleProvider } from '../firebase';
 import {
   ApiError,
+  approveAccessRequestApi,
   approveDeletionRequestApi,
   approveNegativeRequestApi,
   BootstrapResponse,
@@ -39,8 +42,10 @@ import {
   fetchBootstrapData,
   patchShowProductPhotosApi,
   recordMovementApi,
+  rejectAccessRequestApi,
   rejectDeletionRequestApi,
   rejectNegativeRequestApi,
+  requestAccessApi,
   resetAllDataApi,
   toggleCollaboratorActiveApi,
   updateCollaboratorApi,
@@ -53,6 +58,7 @@ import {
   verifyEmailInviteApi,
 } from '../services/apiService';
 import {
+  AccessRequest,
   Collaborator,
   DeletionLog,
   DeletionRecordType,
@@ -73,6 +79,7 @@ export type AccessStatus =
   | 'unauthenticated'
   | 'email_unverified'
   | 'unauthorized'
+  | 'server_error'
   | 'ready';
 export type SettingsSubTab =
   | 'listas'
@@ -103,6 +110,26 @@ interface AppContextType {
   ) => Promise<{ success: boolean; message?: string }>;
   signInWithGoogle: () => Promise<void>;
   signOutGoogle: () => Promise<void>;
+  retryBootstrap: () => Promise<boolean>;
+  submitAccessRequest: (params: {
+    name: string;
+    email: string;
+    role?: string;
+    department?: string;
+    reason?: string;
+  }) => Promise<{ success: boolean; alreadyAuthorized?: boolean; message: string }>;
+  accessRequests: AccessRequest[];
+  pendingAccessRequestsCount: number;
+  approveAccessRequest: (
+    requestId: string,
+    options?: {
+      role?: string;
+      department?: string;
+      canDelete?: boolean;
+      permissions?: Partial<UserPermissions>;
+    }
+  ) => Promise<{ success: boolean; message?: string }>;
+  rejectAccessRequest: (requestId: string) => Promise<{ success: boolean; message?: string }>;
   currentUser: User;
   canDeleteDirectly: boolean;
   users: User[];
@@ -290,6 +317,14 @@ function translateFirebaseAuthError(err: unknown): string {
       return 'Muitas tentativas em sequência. Aguarde alguns minutos e tente novamente.';
     case 'auth/operation-not-allowed':
       return 'O login por E-mail/Senha ainda não foi ativado no Firebase Authentication do projeto.';
+    case 'auth/popup-blocked':
+      return 'O navegador bloqueou a janela de login do Google. Aguarde o redirecionamento ou permita pop-ups.';
+    case 'auth/popup-closed-by-user':
+      return 'A janela de login do Google foi fechada antes de concluir a entrada.';
+    case 'auth/unauthorized-domain':
+      return 'Este domínio ainda não foi liberado nos Domínios Autorizados do Firebase Authentication.';
+    case 'auth/network-request-failed':
+      return 'Falha de conexão com a internet ao autenticar. Verifique sua rede e tente novamente.';
     default:
       return err instanceof Error && err.message
         ? err.message
@@ -314,6 +349,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [negativeRequests, setNegativeRequests] = useState<NegativeStockRequest[]>([]);
   const [deletionRequests, setDeletionRequests] = useState<DeletionRequest[]>([]);
   const [deletionLogs, setDeletionLogs] = useState<DeletionLog[]>([]);
+  const [accessRequests, setAccessRequests] = useState<AccessRequest[]>([]);
 
   // Active Tab & Modal
   const [activeTab, setActiveTabState] = useState<TabId>('dashboard');
@@ -337,6 +373,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setNegativeRequests(data.negativeRequests);
     setDeletionRequests(data.deletionRequests);
     setDeletionLogs(data.deletionLogs);
+    setAccessRequests(Array.isArray(data.accessRequests) ? data.accessRequests : []);
     setManagedLists(data.managedLists);
     setSettings(data.settings);
   }, []);
@@ -350,6 +387,48 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       console.error('Failed to refresh bootstrap data:', err);
     }
   }, [applyBootstrapData]);
+
+  const loadAuthorizedSession = useCallback(async (): Promise<boolean> => {
+    if (!auth.currentUser) {
+      setAccessStatus('unauthenticated');
+      return false;
+    }
+    setAccessStatus('loading');
+    setAuthError(null);
+    try {
+      const data = await fetchBootstrapData();
+      applyBootstrapData(data);
+      setAccessStatus('ready');
+      return true;
+    } catch (err) {
+      console.error('Auth/bootstrap initialization error:', err);
+      setIsRealAdmin(false);
+      const msg =
+        err instanceof ApiError || err instanceof Error
+          ? err.message
+          : 'Erro ao conectar ao servidor.';
+      setAuthError(msg);
+      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+        setAccessStatus('unauthorized');
+      } else {
+        setAccessStatus('server_error');
+      }
+      return false;
+    }
+  }, [applyBootstrapData]);
+
+  // Capture Google redirect result (mobile fallback)
+  useEffect(() => {
+    void getRedirectResult(auth).catch((err) => {
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code || '')
+          : '';
+      if (code && code !== 'auth/no-auth-event') {
+        setAuthError(translateFirebaseAuthError(err));
+      }
+    });
+  }, []);
 
   // Auth listener & Bootstrap
   useEffect(() => {
@@ -365,6 +444,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setNegativeRequests([]);
         setDeletionRequests([]);
         setDeletionLogs([]);
+        setAccessRequests([]);
         setAccessStatus('unauthenticated');
         return;
       }
@@ -375,25 +455,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return;
       }
 
-      setAccessStatus('loading');
-      try {
-        const data = await fetchBootstrapData();
-        applyBootstrapData(data);
-        setAccessStatus('ready');
-      } catch (err) {
-        console.error('Auth/bootstrap initialization error:', err);
-        setIsRealAdmin(false);
-        const msg =
-          err instanceof ApiError || err instanceof Error
-            ? err.message
-            : 'Erro ao conectar ao servidor.';
-        setAuthError(msg);
-        setAccessStatus('unauthorized');
-      }
+      await loadAuthorizedSession();
     });
 
     return () => unsubscribe();
-  }, [applyBootstrapData]);
+  }, [loadAuthorizedSession]);
+
+  // Keep connected clients synchronized with Cloud SQL & Supabase
+  useEffect(() => {
+    if (accessStatus !== 'ready') return;
+
+    const handleVisibleOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshBootstrap();
+      }
+    };
+
+    const intervalId = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshBootstrap();
+      }
+    }, 20000);
+
+    window.addEventListener('focus', handleVisibleOrFocus);
+    document.addEventListener('visibilitychange', handleVisibleOrFocus);
+
+    return () => {
+      clearInterval(intervalId);
+      window.removeEventListener('focus', handleVisibleOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibleOrFocus);
+    };
+  }, [accessStatus, refreshBootstrap]);
 
   useEffect(() => {
     return () => {
@@ -475,10 +567,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
       }
       await auth.currentUser.getIdToken(true);
-      setAccessStatus('loading');
-      const data = await fetchBootstrapData();
-      applyBootstrapData(data);
-      setAccessStatus('ready');
+      const ok = await loadAuthorizedSession();
+      if (!ok) {
+        return {
+          verified: false,
+          message: authError || 'Não foi possível validar o acesso no servidor.',
+        };
+      }
       return { verified: true };
     } catch (err) {
       const msg =
@@ -486,10 +581,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           ? err.message
           : 'Erro ao validar acesso.';
       setAuthError(msg);
-      setAccessStatus('unauthorized');
+      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+        setAccessStatus('unauthorized');
+      } else {
+        setAccessStatus('server_error');
+      }
       return { verified: false, message: msg };
     }
-  }, [applyBootstrapData]);
+  }, [authError, loadAuthorizedSession]);
 
   const sendPasswordReset = useCallback(async (email: string) => {
     const cleanEmail = email.trim().toLowerCase();
@@ -537,8 +636,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
-      const msg = translateFirebaseAuthError(err);
-      setAuthError(msg);
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code || '')
+          : '';
+      if (
+        code === 'auth/popup-blocked' ||
+        code === 'auth/operation-not-supported-in-this-environment'
+      ) {
+        try {
+          await signInWithRedirect(auth, googleProvider);
+          return;
+        } catch (redirectErr) {
+          setAuthError(translateFirebaseAuthError(redirectErr));
+          return;
+        }
+      }
+      setAuthError(translateFirebaseAuthError(err));
     }
   }, []);
 
@@ -550,6 +664,102 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       console.error('Sign out error:', err);
     }
   }, []);
+
+  const retryBootstrap = useCallback(async () => {
+    return loadAuthorizedSession();
+  }, [loadAuthorizedSession]);
+
+  const submitAccessRequest = useCallback(
+    async (params: {
+      name: string;
+      email: string;
+      role?: string;
+      department?: string;
+      reason?: string;
+    }) => {
+      try {
+        const res = await requestAccessApi(params);
+        return {
+          success: true,
+          alreadyAuthorized: Boolean(res.alreadyAuthorized),
+          message: res.message,
+        };
+      } catch (err) {
+        return {
+          success: false,
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Não foi possível enviar o pedido de acesso ao servidor.',
+        };
+      }
+    },
+    []
+  );
+
+  const approveAccessRequest = useCallback(
+    async (
+      requestId: string,
+      options?: {
+        role?: string;
+        department?: string;
+        canDelete?: boolean;
+        permissions?: Partial<UserPermissions>;
+      }
+    ) => {
+      if (!firebaseUser || !isRealAdmin) {
+        return {
+          success: false,
+          message: 'Apenas o Administrador principal pode aprovar pedidos de acesso.',
+        };
+      }
+      try {
+        const res = await approveAccessRequestApi(requestId, options);
+        await refreshBootstrap();
+        return {
+          success: true,
+          message: `Acesso liberado para ${res.user.name} (${res.user.email}) e sincronizado com o Supabase!`,
+        };
+      } catch (err) {
+        return {
+          success: false,
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Não foi possível aprovar o pedido de acesso.',
+        };
+      }
+    },
+    [firebaseUser, isRealAdmin, refreshBootstrap]
+  );
+
+  const rejectAccessRequest = useCallback(
+    async (requestId: string) => {
+      if (!firebaseUser || !isRealAdmin) {
+        return {
+          success: false,
+          message: 'Apenas o Administrador principal pode recusar pedidos de acesso.',
+        };
+      }
+      try {
+        const res = await rejectAccessRequestApi(requestId);
+        await refreshBootstrap();
+        return {
+          success: true,
+          message: `Pedido de ${res.request.name} recusado.`,
+        };
+      } catch (err) {
+        return {
+          success: false,
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Não foi possível recusar o pedido de acesso.',
+        };
+      }
+    },
+    [firebaseUser, isRealAdmin, refreshBootstrap]
+  );
 
   // Derived current user
   const currentUser: User = useMemo(() => {
@@ -1459,6 +1669,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return deletionRequests.filter((r) => r.status === 'PENDENTE').length;
   }, [deletionRequests]);
 
+  const pendingAccessRequestsCount = useMemo(() => {
+    return accessRequests.filter((r) => r.status === 'PENDENTE').length;
+  }, [accessRequests]);
+
   return (
     <AppContext.Provider
       value={{
@@ -1474,6 +1688,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         linkOrUpdateEmailPassword,
         signInWithGoogle,
         signOutGoogle,
+        retryBootstrap,
+        submitAccessRequest,
+        accessRequests,
+        pendingAccessRequestsCount,
+        approveAccessRequest,
+        rejectAccessRequest,
         currentUser,
         canDeleteDirectly,
         users,
