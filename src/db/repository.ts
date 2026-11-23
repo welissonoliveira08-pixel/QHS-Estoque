@@ -35,7 +35,7 @@ import {
   deleteProductFromSupabase,
   deleteUserFromSupabase,
   ensureInitialSupabaseSync,
-  pullPendingAccessRequestsFromSupabase,
+  pullFromSupabaseToCloudSql,
   syncAccessRequestToSupabase,
   syncCollaboratorToSupabase,
   syncDeletionLogToSupabase,
@@ -329,6 +329,8 @@ export async function checkEmailInvitationStatus(email: string): Promise<{
 
   try {
     await ensureDefaultsSeeded();
+    await ensureInitialSupabaseSync();
+    await pullFromSupabaseToCloudSql();
 
     if (emailLower === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase()) {
       const ownerRows = await db
@@ -388,6 +390,8 @@ export async function resolveAuthenticatedUser(params: {
 
   try {
     await ensureDefaultsSeeded();
+    await ensureInitialSupabaseSync();
+    await pullFromSupabaseToCloudSql();
 
     if (isBootstrapped) {
       const today = formatDateToday();
@@ -484,36 +488,7 @@ export async function getBootstrapData(currentUser: User, uid: string) {
   try {
     await ensureDefaultsSeeded();
     await ensureInitialSupabaseSync();
-
-    if (currentUser.isAdmin) {
-      const remotePending = await pullPendingAccessRequestsFromSupabase();
-      if (remotePending.length > 0) {
-        const existingEmailsRows = await db
-          .select({ email: users.email, active: users.active })
-          .from(users);
-        const activeEmailSet = new Set(
-          existingEmailsRows.filter((u) => u.active).map((u) => u.email.toLowerCase())
-        );
-
-        for (const item of remotePending) {
-          if (!item.email || activeEmailSet.has(item.email)) continue;
-          await db
-            .insert(accessRequests)
-            .values({
-              id: item.id,
-              orgId: item.orgId || ORG_ID,
-              name: item.name.slice(0, 120),
-              email: item.email.slice(0, 200),
-              role: item.role.slice(0, 100),
-              department: item.department.slice(0, 100),
-              reason: item.reason.slice(0, 500),
-              date: item.date || formatDateTimeNow(),
-              status: 'PENDENTE',
-            })
-            .onConflictDoNothing({ target: accessRequests.id });
-        }
-      }
-    }
+    await pullFromSupabaseToCloudSql();
 
     const [
       allUsersRows,

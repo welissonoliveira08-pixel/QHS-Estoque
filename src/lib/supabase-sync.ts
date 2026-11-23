@@ -1,3 +1,4 @@
+import { eq, inArray } from 'drizzle-orm';
 import { db } from '../db/index.ts';
 import {
   accessRequests,
@@ -11,6 +12,8 @@ import {
   systemSettings,
   users,
 } from '../db/schema.ts';
+import { normalizePermissions } from '../db/shared.ts';
+import type { UserPermissions } from '../types/index.ts';
 
 type UserRow = typeof users.$inferSelect;
 type CollaboratorRow = typeof collaborators.$inferSelect;
@@ -34,6 +37,9 @@ let initialSyncPromise: Promise<boolean> | null = null;
 let lastWarnedSignature: string | null = null;
 let blockedSignature: string | null = null;
 let lastBlockReason: string | null = null;
+let lastPullAt = 0;
+let inFlightPull: Promise<boolean> | null = null;
+const PULL_THROTTLE_MS = 8000;
 
 function stripWrappingQuotes(value: string): string {
   return value.trim().replace(/^["']+|["']+$/g, '').trim();
@@ -348,7 +354,7 @@ function toSupabaseAccessRequest(row: AccessRequestRow) {
 
 function handleHttpFailure(
   config: SupabaseConfig,
-  operation: 'Upsert' | 'Delete',
+  operation: 'Upsert' | 'Delete' | 'Select',
   table: string,
   status: number,
   errorText: string
@@ -608,6 +614,688 @@ export async function pullPendingAccessRequestsFromSupabase(): Promise<RemotePen
   }
 }
 
+function parseDateValue(value: unknown, fallback = new Date()): Date {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  if (typeof value === 'string' || typeof value === 'number') {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return fallback;
+}
+
+function toMillis(value: unknown): number {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isNaN(ms) ? 0 : ms;
+  }
+  if (typeof value === 'string' || typeof value === 'number') {
+    const ms = new Date(value).getTime();
+    return Number.isNaN(ms) ? 0 : ms;
+  }
+  return 0;
+}
+
+function shouldUpdateSeedAwareRow(
+  localCreatedAt: Date,
+  localUpdatedAt: Date,
+  remoteCreatedAt: unknown,
+  remoteUpdatedAt: unknown
+): boolean {
+  const remoteUpdMs = toMillis(remoteUpdatedAt);
+  const localUpdMs = toMillis(localUpdatedAt);
+  if (remoteUpdMs > localUpdMs) return true;
+
+  const localIsUntouchedSeed = Math.abs(localUpdMs - toMillis(localCreatedAt)) < 2000;
+  const remoteWasEdited = remoteUpdMs > toMillis(remoteCreatedAt) + 2000;
+  return localIsUntouchedSeed && remoteWasEdited;
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
+async function fetchSupabaseTable(
+  config: SupabaseConfig,
+  table: string,
+  ignoreMissing = false
+): Promise<{ ok: boolean; rows: Array<Record<string, unknown>> }> {
+  try {
+    const response = await fetch(`${config.url}/rest/v1/${table}?select=*&limit=10000`, {
+      method: 'GET',
+      headers: buildHeaders(config.key, { Range: '0-9999' }),
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => '');
+      const isMissingTable =
+        response.status === 404 || errorText.includes('PGRST205') || errorText.includes('42P01');
+      if (ignoreMissing && isMissingTable) {
+        return { ok: true, rows: [] };
+      }
+      handleHttpFailure(config, 'Select', table, response.status, errorText);
+      return { ok: false, rows: [] };
+    }
+
+    const parsed = (await response.json().catch(() => [])) as unknown;
+    return {
+      ok: true,
+      rows: Array.isArray(parsed) ? (parsed as Array<Record<string, unknown>>) : [],
+    };
+  } catch (error) {
+    handleNetworkFailure(config, table, error);
+    return { ok: false, rows: [] };
+  }
+}
+
+async function runPullFromSupabaseToCloudSql(config: SupabaseConfig): Promise<boolean> {
+  try {
+    const [
+      delLogsRes,
+      settingsRes,
+      listsRes,
+      usersRes,
+      collabsRes,
+      prodsRes,
+      movsRes,
+      negReqsRes,
+      delReqsRes,
+      accReqsRes,
+    ] = await Promise.all([
+      fetchSupabaseTable(config, 'deletion_logs'),
+      fetchSupabaseTable(config, 'system_settings'),
+      fetchSupabaseTable(config, 'managed_lists'),
+      fetchSupabaseTable(config, 'users'),
+      fetchSupabaseTable(config, 'collaborators'),
+      fetchSupabaseTable(config, 'products'),
+      fetchSupabaseTable(config, 'movements'),
+      fetchSupabaseTable(config, 'negative_requests'),
+      fetchSupabaseTable(config, 'deletion_requests'),
+      fetchSupabaseTable(config, 'access_requests', true),
+    ]);
+
+    if (
+      !delLogsRes.ok ||
+      !settingsRes.ok ||
+      !listsRes.ok ||
+      !usersRes.ok ||
+      !collabsRes.ok ||
+      !prodsRes.ok ||
+      !movsRes.ok ||
+      !negReqsRes.ok ||
+      !delReqsRes.ok
+    ) {
+      return false;
+    }
+
+    await db.transaction(async (tx) => {
+      // 1. Deletion logs + deletion propagation
+      const existingDelLogs = await tx.select({ id: deletionLogs.id }).from(deletionLogs);
+      const existingDelLogIds = new Set(existingDelLogs.map((l) => l.id));
+
+      const deletedProductIds = new Set<string>();
+      const deletedCollaboratorIds = new Set<string>();
+      const deletedMovementIds = new Set<string>();
+      const deletedNegativeRequestIds = new Set<string>();
+
+      for (const r of delLogsRes.rows) {
+        if (typeof r.id !== 'string' || typeof r.target_id !== 'string') continue;
+        const recordType = String(r.record_type || 'PRODUTO');
+        if (recordType === 'PRODUTO') deletedProductIds.add(r.target_id);
+        else if (recordType === 'COLABORADOR') deletedCollaboratorIds.add(r.target_id);
+        else if (recordType === 'ENTRADA' || recordType === 'SAIDA') {
+          deletedMovementIds.add(r.target_id);
+        } else if (recordType === 'SOLICITACAO_NEGATIVA') {
+          deletedNegativeRequestIds.add(r.target_id);
+        }
+
+        if (!existingDelLogIds.has(r.id)) {
+          await tx
+            .insert(deletionLogs)
+            .values({
+              id: r.id,
+              orgId: typeof r.org_id === 'string' ? r.org_id : 'qhs-engenharia',
+              origin: typeof r.origin === 'string' ? r.origin : 'DIRETA',
+              requestId: typeof r.request_id === 'string' ? r.request_id : null,
+              recordType,
+              targetId: r.target_id,
+              targetCode: typeof r.target_code === 'string' ? r.target_code : '',
+              targetName: typeof r.target_name === 'string' ? r.target_name : '',
+              targetDetails: typeof r.target_details === 'string' ? r.target_details : '',
+              quantity: Number(r.quantity ?? 0),
+              reason: typeof r.reason === 'string' ? r.reason : '',
+              requestedBy: typeof r.requested_by === 'string' ? r.requested_by : '',
+              requestedByDate: typeof r.requested_by_date === 'string' ? r.requested_by_date : '',
+              approvedBy: typeof r.approved_by === 'string' ? r.approved_by : null,
+              approvedAt: typeof r.approved_at === 'string' ? r.approved_at : null,
+              deletedBy: typeof r.deleted_by === 'string' ? r.deleted_by : '',
+              deletedByEmail: typeof r.deleted_by_email === 'string' ? r.deleted_by_email : '',
+              deletedByUid: typeof r.deleted_by_uid === 'string' ? r.deleted_by_uid : '',
+              deletedAt: typeof r.deleted_at === 'string' ? r.deleted_at : '',
+              createdAt: parseDateValue(r.created_at),
+            })
+            .onConflictDoNothing({ target: deletionLogs.id });
+          existingDelLogIds.add(r.id);
+        }
+      }
+
+      if (deletedMovementIds.size > 0) {
+        await tx.delete(movements).where(inArray(movements.id, [...deletedMovementIds]));
+      }
+      if (deletedNegativeRequestIds.size > 0) {
+        await tx
+          .delete(negativeRequests)
+          .where(inArray(negativeRequests.id, [...deletedNegativeRequestIds]));
+      }
+      if (deletedCollaboratorIds.size > 0) {
+        await tx
+          .delete(collaborators)
+          .where(inArray(collaborators.id, [...deletedCollaboratorIds]));
+      }
+      if (deletedProductIds.size > 0) {
+        await tx.delete(products).where(inArray(products.id, [...deletedProductIds]));
+      }
+
+      // 2. System settings
+      const localSettings = await tx.select().from(systemSettings);
+      const settingsById = new Map(localSettings.map((s) => [s.id, s]));
+      for (const r of settingsRes.rows) {
+        if (typeof r.id !== 'string') continue;
+        const local = settingsById.get(r.id);
+        if (!local) {
+          await tx
+            .insert(systemSettings)
+            .values({
+              id: r.id,
+              showProductPhotos: Boolean(r.show_product_photos ?? true),
+              companyName: typeof r.company_name === 'string' ? r.company_name : 'QHS Engenharia',
+              companySubtitle:
+                typeof r.company_subtitle === 'string' ? r.company_subtitle : '',
+              cnpj: typeof r.cnpj === 'string' ? r.cnpj : '',
+              contactEmail: typeof r.contact_email === 'string' ? r.contact_email : '',
+              lowStockAlertNotification: Boolean(r.low_stock_alert_notification ?? true),
+              createdAt: parseDateValue(r.created_at),
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .onConflictDoNothing({ target: systemSettings.id });
+        } else if (
+          shouldUpdateSeedAwareRow(local.createdAt, local.updatedAt, r.created_at, r.updated_at)
+        ) {
+          await tx
+            .update(systemSettings)
+            .set({
+              showProductPhotos: Boolean(r.show_product_photos ?? local.showProductPhotos),
+              companyName:
+                typeof r.company_name === 'string' ? r.company_name : local.companyName,
+              companySubtitle:
+                typeof r.company_subtitle === 'string'
+                  ? r.company_subtitle
+                  : local.companySubtitle,
+              cnpj: typeof r.cnpj === 'string' ? r.cnpj : local.cnpj,
+              contactEmail:
+                typeof r.contact_email === 'string' ? r.contact_email : local.contactEmail,
+              lowStockAlertNotification: Boolean(
+                r.low_stock_alert_notification ?? local.lowStockAlertNotification
+              ),
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .where(eq(systemSettings.id, local.id));
+        }
+      }
+
+      // 3. Managed lists
+      const localLists = await tx.select().from(managedLists);
+      const listsById = new Map(localLists.map((l) => [l.id, l]));
+      for (const r of listsRes.rows) {
+        if (typeof r.id !== 'string') continue;
+        const local = listsById.get(r.id);
+        const groups = toStringArray(r.groups);
+        const roles = toStringArray(r.roles);
+        const destinations = toStringArray(r.destinations);
+        if (!local) {
+          await tx
+            .insert(managedLists)
+            .values({
+              id: r.id,
+              groups,
+              roles,
+              destinations,
+              createdAt: parseDateValue(r.created_at),
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .onConflictDoNothing({ target: managedLists.id });
+        } else if (
+          shouldUpdateSeedAwareRow(local.createdAt, local.updatedAt, r.created_at, r.updated_at)
+        ) {
+          await tx
+            .update(managedLists)
+            .set({
+              groups,
+              roles,
+              destinations,
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .where(eq(managedLists.id, local.id));
+        }
+      }
+
+      // 4. Users
+      const localUsers = await tx.select().from(users);
+      const userById = new Map(localUsers.map((u) => [u.id, u]));
+      const userByEmail = new Map(localUsers.map((u) => [u.email.toLowerCase(), u]));
+      const userByUid = new Map(
+        localUsers.filter((u) => Boolean(u.uid)).map((u) => [String(u.uid), u])
+      );
+
+      for (const r of usersRes.rows) {
+        if (typeof r.id !== 'string' || typeof r.email !== 'string') continue;
+        const emailLower = r.email.trim().toLowerCase();
+        if (!emailLower) continue;
+
+        const local = userById.get(r.id) ?? userByEmail.get(emailLower);
+        const rawUid = typeof r.uid === 'string' && r.uid.trim() ? r.uid.trim() : null;
+        const conflictingUidOwner = rawUid ? userByUid.get(rawUid) : undefined;
+        const safeUid =
+          rawUid && (!conflictingUidOwner || conflictingUidOwner.id === (local?.id ?? r.id))
+            ? rawUid
+            : null;
+        const perms = normalizePermissions(
+          (r.permissions as Partial<UserPermissions> | null) || undefined
+        );
+
+        if (!local) {
+          const inserted = await tx
+            .insert(users)
+            .values({
+              id: r.id,
+              uid: safeUid,
+              name: typeof r.name === 'string' ? r.name : emailLower,
+              email: emailLower,
+              role: typeof r.role === 'string' ? r.role : 'Operador de Estoque',
+              department: typeof r.department === 'string' ? r.department : '',
+              isAdmin: Boolean(r.is_admin),
+              canDelete: Boolean(r.is_admin || r.can_delete),
+              active: r.active !== false,
+              permissions: perms,
+              registrationDate:
+                typeof r.registration_date === 'string' ? r.registration_date : '',
+              createdAt: parseDateValue(r.created_at),
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .onConflictDoNothing({ target: users.id })
+            .returning();
+          if (inserted[0]) {
+            userById.set(inserted[0].id, inserted[0]);
+            userByEmail.set(inserted[0].email.toLowerCase(), inserted[0]);
+            if (inserted[0].uid) userByUid.set(inserted[0].uid, inserted[0]);
+          }
+        } else if (
+          toMillis(r.updated_at) > toMillis(local.updatedAt) ||
+          (!local.uid && Boolean(safeUid))
+        ) {
+          const nextUid = safeUid ?? local.uid ?? null;
+          const updated = await tx
+            .update(users)
+            .set({
+              uid: nextUid,
+              name: typeof r.name === 'string' ? r.name : local.name,
+              role: typeof r.role === 'string' ? r.role : local.role,
+              department: typeof r.department === 'string' ? r.department : local.department,
+              isAdmin: Boolean(r.is_admin),
+              canDelete: Boolean(r.is_admin || r.can_delete),
+              active: r.active !== false,
+              permissions: perms,
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .where(eq(users.id, local.id))
+            .returning();
+          if (updated[0]) {
+            userById.set(updated[0].id, updated[0]);
+            userByEmail.set(updated[0].email.toLowerCase(), updated[0]);
+            if (updated[0].uid) userByUid.set(updated[0].uid, updated[0]);
+          }
+        }
+      }
+
+      // 5. Collaborators
+      const localCollabs = await tx.select().from(collaborators);
+      const collabMap = new Map(localCollabs.map((c) => [c.id, c]));
+      for (const r of collabsRes.rows) {
+        if (typeof r.id !== 'string' || deletedCollaboratorIds.has(r.id)) continue;
+        const local = collabMap.get(r.id);
+        if (!local) {
+          const inserted = await tx
+            .insert(collaborators)
+            .values({
+              id: r.id,
+              orgId: typeof r.org_id === 'string' ? r.org_id : 'qhs-engenharia',
+              fullName: typeof r.full_name === 'string' ? r.full_name : '',
+              role: typeof r.role === 'string' ? r.role : '',
+              active: r.active !== false,
+              registrationDate:
+                typeof r.registration_date === 'string' ? r.registration_date : '',
+              displayUpdatedAt:
+                typeof r.display_updated_at === 'string' ? r.display_updated_at : '',
+              ownerUid: typeof r.owner_uid === 'string' ? r.owner_uid : '',
+              createdAt: parseDateValue(r.created_at),
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .onConflictDoNothing({ target: collaborators.id })
+            .returning();
+          if (inserted[0]) collabMap.set(inserted[0].id, inserted[0]);
+        } else if (toMillis(r.updated_at) > toMillis(local.updatedAt)) {
+          const updated = await tx
+            .update(collaborators)
+            .set({
+              fullName: typeof r.full_name === 'string' ? r.full_name : local.fullName,
+              role: typeof r.role === 'string' ? r.role : local.role,
+              active: r.active !== false,
+              displayUpdatedAt:
+                typeof r.display_updated_at === 'string'
+                  ? r.display_updated_at
+                  : local.displayUpdatedAt,
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .where(eq(collaborators.id, local.id))
+            .returning();
+          if (updated[0]) collabMap.set(updated[0].id, updated[0]);
+        }
+      }
+
+      // 6. Products
+      const localProducts = await tx.select().from(products);
+      const productMap = new Map(localProducts.map((p) => [p.id, p]));
+      for (const r of prodsRes.rows) {
+        if (typeof r.id !== 'string' || deletedProductIds.has(r.id)) continue;
+        const local = productMap.get(r.id);
+        if (!local) {
+          const inserted = await tx
+            .insert(products)
+            .values({
+              id: r.id,
+              orgId: typeof r.org_id === 'string' ? r.org_id : 'qhs-engenharia',
+              code: typeof r.code === 'string' ? r.code : '',
+              name: typeof r.name === 'string' ? r.name : '',
+              groupName: typeof r.group_name === 'string' ? r.group_name : '',
+              currentStock: Number(r.current_stock ?? 0),
+              minStock: Number(r.min_stock ?? 0),
+              photoUrl: typeof r.photo_url === 'string' ? r.photo_url : '',
+              description: typeof r.description === 'string' ? r.description : '',
+              registrationDate:
+                typeof r.registration_date === 'string' ? r.registration_date : '',
+              displayUpdatedAt:
+                typeof r.display_updated_at === 'string' ? r.display_updated_at : '',
+              ownerUid: typeof r.owner_uid === 'string' ? r.owner_uid : '',
+              createdAt: parseDateValue(r.created_at),
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .onConflictDoNothing({ target: products.id })
+            .returning();
+          if (inserted[0]) productMap.set(inserted[0].id, inserted[0]);
+        } else if (toMillis(r.updated_at) > toMillis(local.updatedAt)) {
+          const updated = await tx
+            .update(products)
+            .set({
+              code: typeof r.code === 'string' ? r.code : local.code,
+              name: typeof r.name === 'string' ? r.name : local.name,
+              groupName: typeof r.group_name === 'string' ? r.group_name : local.groupName,
+              currentStock: Number(r.current_stock ?? local.currentStock),
+              minStock: Number(r.min_stock ?? local.minStock),
+              photoUrl: typeof r.photo_url === 'string' ? r.photo_url : local.photoUrl,
+              description:
+                typeof r.description === 'string' ? r.description : local.description,
+              displayUpdatedAt:
+                typeof r.display_updated_at === 'string'
+                  ? r.display_updated_at
+                  : local.displayUpdatedAt,
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .where(eq(products.id, local.id))
+            .returning();
+          if (updated[0]) productMap.set(updated[0].id, updated[0]);
+        }
+      }
+
+      // 7. Movements
+      const localMovs = await tx.select().from(movements);
+      const movMap = new Map(localMovs.map((m) => [m.id, m]));
+      for (const r of movsRes.rows) {
+        if (typeof r.id !== 'string' || typeof r.product_id !== 'string') continue;
+        if (
+          deletedMovementIds.has(r.id) ||
+          deletedProductIds.has(r.product_id) ||
+          !productMap.has(r.product_id)
+        ) {
+          continue;
+        }
+        const safeCollabId =
+          typeof r.collaborator_id === 'string' && collabMap.has(r.collaborator_id)
+            ? r.collaborator_id
+            : null;
+        const local = movMap.get(r.id);
+        if (!local) {
+          await tx
+            .insert(movements)
+            .values({
+              id: r.id,
+              orgId: typeof r.org_id === 'string' ? r.org_id : 'qhs-engenharia',
+              productId: r.product_id,
+              productCode: typeof r.product_code === 'string' ? r.product_code : '',
+              productName: typeof r.product_name === 'string' ? r.product_name : '',
+              groupName: typeof r.group_name === 'string' ? r.group_name : '',
+              type: r.type === 'ENTRADA' ? 'ENTRADA' : 'SAIDA',
+              quantity: Number(r.quantity ?? 0),
+              stockAfterMovement: Number(r.stock_after_movement ?? 0),
+              date: typeof r.date === 'string' ? r.date : '',
+              withdrawnBy: typeof r.withdrawn_by === 'string' ? r.withdrawn_by : null,
+              collaboratorId: safeCollabId,
+              responsibleUser:
+                typeof r.responsible_user === 'string' ? r.responsible_user : '',
+              destination: typeof r.destination === 'string' ? r.destination : null,
+              notes: typeof r.notes === 'string' ? r.notes : null,
+              isNegativeStockAuthorized:
+                r.is_negative_stock_authorized === null ||
+                r.is_negative_stock_authorized === undefined
+                  ? null
+                  : Boolean(r.is_negative_stock_authorized),
+              authorizedBy: typeof r.authorized_by === 'string' ? r.authorized_by : null,
+              ownerUid: typeof r.owner_uid === 'string' ? r.owner_uid : '',
+              createdAt: parseDateValue(r.created_at),
+            })
+            .onConflictDoNothing({ target: movements.id });
+        } else if (typeof r.group_name === 'string' && r.group_name !== local.groupName) {
+          await tx
+            .update(movements)
+            .set({ groupName: r.group_name })
+            .where(eq(movements.id, local.id));
+        }
+      }
+
+      // 8. Negative requests
+      const localNegReqs = await tx.select().from(negativeRequests);
+      const negMap = new Map(localNegReqs.map((n) => [n.id, n]));
+      for (const r of negReqsRes.rows) {
+        if (typeof r.id !== 'string' || typeof r.product_id !== 'string') continue;
+        if (
+          deletedNegativeRequestIds.has(r.id) ||
+          deletedProductIds.has(r.product_id) ||
+          !productMap.has(r.product_id)
+        ) {
+          continue;
+        }
+        const safeCollabId =
+          typeof r.collaborator_id === 'string' && collabMap.has(r.collaborator_id)
+            ? r.collaborator_id
+            : null;
+        const local = negMap.get(r.id);
+        if (!local) {
+          await tx
+            .insert(negativeRequests)
+            .values({
+              id: r.id,
+              orgId: typeof r.org_id === 'string' ? r.org_id : 'qhs-engenharia',
+              productId: r.product_id,
+              productCode: typeof r.product_code === 'string' ? r.product_code : '',
+              productName: typeof r.product_name === 'string' ? r.product_name : '',
+              groupName: typeof r.group_name === 'string' ? r.group_name : '',
+              requestedQuantity: Number(r.requested_quantity ?? 0),
+              availableStock: Number(r.available_stock ?? 0),
+              deficitQuantity: Number(r.deficit_quantity ?? 0),
+              withdrawnBy: typeof r.withdrawn_by === 'string' ? r.withdrawn_by : '',
+              collaboratorId: safeCollabId,
+              destination: typeof r.destination === 'string' ? r.destination : '',
+              requestedBy: typeof r.requested_by === 'string' ? r.requested_by : '',
+              requestedByUid: typeof r.requested_by_uid === 'string' ? r.requested_by_uid : '',
+              reason: typeof r.reason === 'string' ? r.reason : '',
+              date: typeof r.date === 'string' ? r.date : '',
+              status: typeof r.status === 'string' ? r.status : 'PENDENTE',
+              reviewedBy: typeof r.reviewed_by === 'string' ? r.reviewed_by : null,
+              reviewedAt: typeof r.reviewed_at === 'string' ? r.reviewed_at : null,
+              createdAt: parseDateValue(r.created_at),
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .onConflictDoNothing({ target: negativeRequests.id });
+        } else if (toMillis(r.updated_at) > toMillis(local.updatedAt)) {
+          await tx
+            .update(negativeRequests)
+            .set({
+              status: typeof r.status === 'string' ? r.status : local.status,
+              reviewedBy: typeof r.reviewed_by === 'string' ? r.reviewed_by : null,
+              reviewedAt: typeof r.reviewed_at === 'string' ? r.reviewed_at : null,
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .where(eq(negativeRequests.id, local.id));
+        }
+      }
+
+      // 9. Deletion requests
+      const localDelReqs = await tx.select().from(deletionRequests);
+      const delReqMap = new Map(localDelReqs.map((d) => [d.id, d]));
+      for (const r of delReqsRes.rows) {
+        if (typeof r.id !== 'string' || typeof r.target_id !== 'string') continue;
+        const local = delReqMap.get(r.id);
+        if (!local) {
+          await tx
+            .insert(deletionRequests)
+            .values({
+              id: r.id,
+              orgId: typeof r.org_id === 'string' ? r.org_id : 'qhs-engenharia',
+              recordType: typeof r.record_type === 'string' ? r.record_type : 'PRODUTO',
+              targetId: r.target_id,
+              targetCode: typeof r.target_code === 'string' ? r.target_code : '',
+              targetName: typeof r.target_name === 'string' ? r.target_name : '',
+              targetDetails: typeof r.target_details === 'string' ? r.target_details : '',
+              quantity: Number(r.quantity ?? 0),
+              reason: typeof r.reason === 'string' ? r.reason : '',
+              requestedBy: typeof r.requested_by === 'string' ? r.requested_by : '',
+              requestedByEmail:
+                typeof r.requested_by_email === 'string' ? r.requested_by_email : '',
+              requestedByUid: typeof r.requested_by_uid === 'string' ? r.requested_by_uid : '',
+              date: typeof r.date === 'string' ? r.date : '',
+              status: typeof r.status === 'string' ? r.status : 'PENDENTE',
+              reviewedBy: typeof r.reviewed_by === 'string' ? r.reviewed_by : null,
+              reviewedByEmail:
+                typeof r.reviewed_by_email === 'string' ? r.reviewed_by_email : null,
+              reviewedAt: typeof r.reviewed_at === 'string' ? r.reviewed_at : null,
+              executedBy: typeof r.executed_by === 'string' ? r.executed_by : null,
+              executedAt: typeof r.executed_at === 'string' ? r.executed_at : null,
+              createdAt: parseDateValue(r.created_at),
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .onConflictDoNothing({ target: deletionRequests.id });
+        } else if (toMillis(r.updated_at) > toMillis(local.updatedAt)) {
+          await tx
+            .update(deletionRequests)
+            .set({
+              status: typeof r.status === 'string' ? r.status : local.status,
+              reviewedBy: typeof r.reviewed_by === 'string' ? r.reviewed_by : null,
+              reviewedByEmail:
+                typeof r.reviewed_by_email === 'string' ? r.reviewed_by_email : null,
+              reviewedAt: typeof r.reviewed_at === 'string' ? r.reviewed_at : null,
+              executedBy: typeof r.executed_by === 'string' ? r.executed_by : null,
+              executedAt: typeof r.executed_at === 'string' ? r.executed_at : null,
+              updatedAt: parseDateValue(r.updated_at),
+            })
+            .where(eq(deletionRequests.id, local.id));
+        }
+      }
+
+      // 10. Access requests
+      if (accReqsRes.rows.length > 0) {
+        const localAccReqs = await tx.select().from(accessRequests);
+        const accReqMap = new Map(localAccReqs.map((a) => [a.id, a]));
+        for (const r of accReqsRes.rows) {
+          if (typeof r.id !== 'string' || typeof r.email !== 'string') continue;
+          const emailLower = r.email.trim().toLowerCase();
+          const local = accReqMap.get(r.id);
+          if (!local) {
+            await tx
+              .insert(accessRequests)
+              .values({
+                id: r.id,
+                orgId: typeof r.org_id === 'string' ? r.org_id : 'qhs-engenharia',
+                name: typeof r.name === 'string' ? r.name : emailLower,
+                email: emailLower,
+                role: typeof r.role === 'string' ? r.role : '',
+                department: typeof r.department === 'string' ? r.department : '',
+                reason: typeof r.reason === 'string' ? r.reason : '',
+                date: typeof r.date === 'string' ? r.date : '',
+                status: typeof r.status === 'string' ? r.status : 'PENDENTE',
+                reviewedBy: typeof r.reviewed_by === 'string' ? r.reviewed_by : null,
+                reviewedAt: typeof r.reviewed_at === 'string' ? r.reviewed_at : null,
+                createdAt: parseDateValue(r.created_at),
+                updatedAt: parseDateValue(r.updated_at),
+              })
+              .onConflictDoNothing({ target: accessRequests.id });
+          } else if (toMillis(r.updated_at) > toMillis(local.updatedAt)) {
+            await tx
+              .update(accessRequests)
+              .set({
+                name: typeof r.name === 'string' ? r.name : local.name,
+                role: typeof r.role === 'string' ? r.role : local.role,
+                department: typeof r.department === 'string' ? r.department : local.department,
+                reason: typeof r.reason === 'string' ? r.reason : local.reason,
+                date: typeof r.date === 'string' ? r.date : local.date,
+                status: typeof r.status === 'string' ? r.status : local.status,
+                reviewedBy: typeof r.reviewed_by === 'string' ? r.reviewed_by : null,
+                reviewedAt: typeof r.reviewed_at === 'string' ? r.reviewed_at : null,
+                updatedAt: parseDateValue(r.updated_at),
+              })
+              .where(eq(accessRequests.id, local.id));
+          }
+        }
+      }
+    });
+
+    lastPullAt = Date.now();
+    return true;
+  } catch (error) {
+    console.error('[Supabase Sync] Failed pulling from Supabase to Cloud SQL:', error);
+    return false;
+  }
+}
+
+export async function pullFromSupabaseToCloudSql(options?: { force?: boolean }): Promise<boolean> {
+  const config = ensureWritableConfig();
+  if (!config) return false;
+
+  const force = Boolean(options?.force);
+  if (!force && Date.now() - lastPullAt < PULL_THROTTLE_MS) {
+    return true;
+  }
+
+  if (inFlightPull) {
+    return inFlightPull;
+  }
+
+  inFlightPull = runPullFromSupabaseToCloudSql(config).finally(() => {
+    inFlightPull = null;
+  });
+
+  return inFlightPull;
+}
+
 export async function syncAllTablesToSupabase(): Promise<boolean> {
   const config = ensureWritableConfig();
   if (!config) return false;
@@ -680,11 +1368,15 @@ export async function ensureInitialSupabaseSync(): Promise<boolean> {
   if (initialSyncSignature === sig) return true;
   if (initialSyncPromise) return initialSyncPromise;
 
-  initialSyncPromise = syncAllTablesToSupabase()
+  initialSyncPromise = (async () => {
+    const pulled = await pullFromSupabaseToCloudSql({ force: true });
+    if (!pulled) return false;
+    return syncAllTablesToSupabase();
+  })()
     .then((ok) => {
       if (ok) {
         initialSyncSignature = sig;
-        console.log('[Supabase Sync] Sincronização inicial concluída com sucesso.');
+        console.log('[Supabase Sync] Sincronização bidirecional inicial concluída com sucesso.');
       } else {
         initialSyncPromise = null;
       }
