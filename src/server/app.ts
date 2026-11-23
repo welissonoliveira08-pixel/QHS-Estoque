@@ -25,13 +25,14 @@ export interface AppRepository {
     message?: string;
   }>;
   resolveAuthenticatedUser: ResolveAuthenticatedUserFn;
-  getBootstrapData: (currentUser: User, uid: string) => Promise<unknown>;
+  getBootstrapData: (currentUser: User, uid: string, forceSync?: boolean) => Promise<unknown>;
   updateSystemSettingsInDb: (newSettings: Partial<SystemSettings>) => Promise<void>;
   updateManagedListsInDb: (params: {
     lists: ManagedLists;
     renameGroup?: { oldName: string; newName: string };
     renameRole?: { oldName: string; newName: string };
   }) => Promise<void>;
+  updateDestinationsInDb: (destinations: string[]) => Promise<void>;
   createUserInDb: (newUser: Omit<User, 'id' | 'createdAt'>) => Promise<User>;
   updateUserInDb: (updatedUser: User) => Promise<User>;
   updateUserPermissionsInDb: (userId: string, permissions: UserPermissions) => Promise<void>;
@@ -224,7 +225,8 @@ export function createApiApp(repo: AppRepository): Express {
     '/api/bootstrap',
     requireAuth,
     asyncHandler(async (req, res) => {
-      const data = await repo.getBootstrapData(req.dbUser!, req.user!.uid);
+      const forceSync = req.query.force === '1';
+      const data = await repo.getBootstrapData(req.dbUser!, req.user!.uid, forceSync);
       res.json(data);
     })
   );
@@ -267,6 +269,23 @@ export function createApiApp(repo: AppRepository): Express {
         throw new DomainError('Dados de listas inválidos.', 400);
       }
       await repo.updateManagedListsInDb({ lists, renameGroup, renameRole });
+      res.json({ ok: true });
+    })
+  );
+
+  // Destinations / Clientes e Locais de Destino (any authenticated user with destinos permission)
+  app.put(
+    '/api/destinations',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      if (!req.dbUser!.isAdmin && req.dbUser!.permissions?.destinos === false) {
+        throw new DomainError('Você não possui permissão para alterar clientes e locais de destino.', 403);
+      }
+      const { destinations } = req.body ?? {};
+      if (!Array.isArray(destinations)) {
+        throw new DomainError('Lista de clientes e locais de destino inválida.', 400);
+      }
+      await repo.updateDestinationsInDb(destinations.map((d) => String(d ?? '')));
       res.json({ ok: true });
     })
   );

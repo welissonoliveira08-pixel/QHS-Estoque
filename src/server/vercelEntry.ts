@@ -28,6 +28,7 @@ import {
   resolveAuthenticatedUserSupabase,
   toggleCollaboratorActiveSupabase,
   updateCollaboratorSupabase,
+  updateDestinationsSupabase,
   updateManagedListsSupabase,
   updateProductSupabase,
   updateSystemSettingsSupabase,
@@ -250,6 +251,22 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
         renameGroup: body.renameGroup as { oldName: string; newName: string } | undefined,
         renameRole: body.renameRole as { oldName: string; newName: string } | undefined,
       });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (method === 'PUT' && pathname === '/api/destinations') {
+      if (!session.dbUser.isAdmin && session.dbUser.permissions?.destinos === false) {
+        throw new DomainError(
+          'Você não possui permissão para alterar clientes e locais de destino.',
+          403
+        );
+      }
+      const body = await readJsonBody(req);
+      if (!Array.isArray(body.destinations)) {
+        throw new DomainError('Lista de clientes e locais de destino inválida.', 400);
+      }
+      await updateDestinationsSupabase(body.destinations.map((d) => String(d ?? '')));
       sendJson(res, 200, { ok: true });
       return;
     }

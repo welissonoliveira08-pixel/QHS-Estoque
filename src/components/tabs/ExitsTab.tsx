@@ -610,7 +610,7 @@ export const ExitsTab: React.FC = () => {
               <th className="py-3 px-4 text-right">Qtd. Retirada</th>
               <th className="py-3 px-4 text-right">Saldo Restante</th>
               <th className="py-3 px-4 font-bold text-red-400">Colaborador que Retirou</th>
-              <th className="py-3 px-4">Obra / Destino</th>
+              <th className="py-3 px-4">Cliente / Destino</th>
               <th className="py-3 px-4">Responsável Registro</th>
               <th className="py-3 px-4 text-center">Ações</th>
             </tr>
@@ -870,11 +870,23 @@ export const ExitsTab: React.FC = () => {
                 )}
               </div>
 
-              {/* 4. Obra de Destino / Frente de Serviço */}
+              {/* 4. Cliente / Local de Destino */}
               <div>
-                <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                  Obra de Destino / Canteiro *
-                </label>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <label className="block text-xs font-semibold text-zinc-700">
+                    Cliente / Local de Destino *
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsModalOpen(false);
+                      setActiveTab('destinos');
+                    }}
+                    className="text-[11px] font-semibold text-red-600 hover:text-red-700 cursor-pointer"
+                  >
+                    + Gerenciar destinos
+                  </button>
+                </div>
                 <select
                   required
                   value={formData.destination}
@@ -883,8 +895,8 @@ export const ExitsTab: React.FC = () => {
                 >
                   <option value="">
                     {managedLists.destinations.length === 0
-                      ? 'Cadastre uma obra em Configurações...'
-                      : 'Selecione a obra / destino...'}
+                      ? 'Cadastre em Clientes e Destinos...'
+                      : 'Selecione o cliente / local de destino...'}
                   </option>
                   {managedLists.destinations.map((dest) => (
                     <option key={dest} value={dest}>

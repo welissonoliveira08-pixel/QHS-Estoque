@@ -32,18 +32,41 @@ import {
   Send,
   Share2,
   ExternalLink,
+  ChevronDown,
+  ChevronUp,
+  Calendar,
 } from 'lucide-react';
 
 const TAB_CONFIGS: { id: TabId; label: string; desc: string }[] = [
   { id: 'dashboard', label: 'Dashboard', desc: 'Acesso a KPIs e alertas' },
   { id: 'produtos', label: 'Cadastro de Produtos', desc: 'Visualizar e cadastrar produtos' },
   { id: 'entradas', label: 'Entradas', desc: 'Recebimento de materiais' },
-  { id: 'saidas', label: 'Saídas', desc: 'Requisições para canteiros de obras' },
+  { id: 'saidas', label: 'Saídas', desc: 'Requisições para clientes e destinos' },
   { id: 'colaboradores', label: 'Colaboradores', desc: 'Cadastro de funcionários de obra (sem login)' },
+  { id: 'destinos', label: 'Clientes e Destinos', desc: 'Visualizar e cadastrar clientes e locais de destino' },
   { id: 'relatorios', label: 'Relatórios', desc: 'Emissão e exportação de relatórios' },
   { id: 'estatisticas', label: 'Estatísticas', desc: 'Giro de estoque e métricas' },
   { id: 'configuracoes', label: 'Configurações', desc: 'Gerenciamento de listas e permissões' },
 ];
+
+function parseAuditDateMs(raw?: string): number | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  const isoMatch = /^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2}):(\d{2}))?/.exec(trimmed);
+  if (isoMatch) {
+    const [, y, m, d, hh = '00', mm = '00'] = isoMatch;
+    const ts = new Date(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm)).getTime();
+    return Number.isNaN(ts) ? null : ts;
+  }
+  const brMatch = /^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?/.exec(trimmed);
+  if (brMatch) {
+    const [, d, m, y, hh = '00', mm = '00'] = brMatch;
+    const ts = new Date(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm)).getTime();
+    return Number.isNaN(ts) ? null : ts;
+  }
+  const fallback = new Date(trimmed).getTime();
+  return Number.isNaN(fallback) ? null : fallback;
+}
 
 const getRecordTypeLabel = (type: DeletionRecordType) => {
   switch (type) {
@@ -87,9 +110,6 @@ export const SettingsTab: React.FC = () => {
     addRole,
     editRole,
     deleteRole,
-    addDestination,
-    editDestination,
-    deleteDestination,
     negativeRequests,
     approveNegativeStockRequest,
     rejectNegativeStockRequest,
@@ -125,9 +145,12 @@ export const SettingsTab: React.FC = () => {
   const [deletionTarget, setDeletionTarget] = useState<DeletionTarget | null>(null);
   const [isSubmittingDeletion, setIsSubmittingDeletion] = useState(false);
 
-  // Deletion requests filter & processing lock in 'exclusoes'
+  // Deletion requests filter, processing lock & collapsible audit history in 'exclusoes'
   const [deletionStatusFilter, setDeletionStatusFilter] = useState<'TODAS' | 'PENDENTE' | 'APROVADO' | 'RECUSADO'>('TODAS');
   const [processingDeletionReqId, setProcessingDeletionReqId] = useState<string | null>(null);
+  const [showDeletionHistory, setShowDeletionHistory] = useState(false);
+  const [historyDaysFilter, setHistoryDaysFilter] = useState<'ALL' | '7' | '15' | '30' | '90' | 'CUSTOM'>('ALL');
+  const [historyCustomDays, setHistoryCustomDays] = useState<string>('30');
 
   useEffect(() => {
     if (!isPrincipalAdminMode) {
@@ -151,9 +174,6 @@ export const SettingsTab: React.FC = () => {
 
   const [newRoleName, setNewRoleName] = useState('');
   const [editingRoleName, setEditingRoleName] = useState<{ oldName: string; currentVal: string } | null>(null);
-
-  const [newDestinationName, setNewDestinationName] = useState('');
-  const [editingDestinationName, setEditingDestinationName] = useState<{ oldName: string; currentVal: string } | null>(null);
 
   // Field Collaborators (no app login) Form States
   const [newCollabFullName, setNewCollabFullName] = useState('');
@@ -183,6 +203,7 @@ export const SettingsTab: React.FC = () => {
       entradas: false,
       saidas: true,
       colaboradores: true,
+      destinos: true,
       relatorios: false,
       estatisticas: false,
       configuracoes: false,
@@ -227,6 +248,28 @@ export const SettingsTab: React.FC = () => {
       ),
     [deletionRequests]
   );
+
+  const activeFilterDays = useMemo(() => {
+    if (historyDaysFilter === 'ALL') return null;
+    const rawDays =
+      historyDaysFilter === 'CUSTOM'
+        ? Number(historyCustomDays)
+        : Number(historyDaysFilter);
+    return Number.isFinite(rawDays) && rawDays > 0 ? rawDays : null;
+  }, [historyDaysFilter, historyCustomDays]);
+
+  const filteredDeletionLogs = useMemo(() => {
+    if (!activeFilterDays) return deletionLogs;
+    const cutoffMs = Date.now() - activeFilterDays * 24 * 60 * 60 * 1000;
+    return deletionLogs.filter((log) => {
+      const logMs =
+        parseAuditDateMs(log.deletedAt) ??
+        parseAuditDateMs(log.approvedAt) ??
+        parseAuditDateMs(log.requestedByDate);
+      if (logMs === null) return false;
+      return logMs >= cutoffMs;
+    });
+  }, [deletionLogs, activeFilterDays]);
 
   const showNotice = (text: string, isError = false) => {
     setNoticeMessage({ text, isError });
@@ -305,39 +348,6 @@ export const SettingsTab: React.FC = () => {
     });
   };
 
-  // Destination / Obras Handlers
-  const handleAddDestSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newDestinationName.trim()) return;
-    const ok = addDestination(newDestinationName);
-    if (ok) {
-      showNotice(`Obra/Canteiro "${newDestinationName}" adicionado!`);
-      setNewDestinationName('');
-    } else {
-      showNotice('Destino já existente.', true);
-    }
-  };
-
-  const handleSaveEditDest = () => {
-    if (!editingDestinationName) return;
-    const ok = editDestination(editingDestinationName.oldName, editingDestinationName.currentVal);
-    if (ok) {
-      showNotice(`Obra renomeada para "${editingDestinationName.currentVal}".`);
-      setEditingDestinationName(null);
-    }
-  };
-
-  const handleDeleteDest = (name: string) => {
-    setConfirmDialog({
-      title: 'Excluir Obra / Destino',
-      message: `Excluir a obra "${name}"?`,
-      onConfirm: () => {
-        deleteDestination(name);
-        showNotice(`Obra "${name}" excluída.`);
-      },
-    });
-  };
-
   // Permissions Toggle
   const handleTogglePermission = (user: User, tabId: TabId) => {
     if (!isPrincipalAdminMode) {
@@ -382,6 +392,7 @@ export const SettingsTab: React.FC = () => {
       entradas: true,
       saidas: true,
       colaboradores: true,
+      destinos: true,
       relatorios: true,
       estatisticas: true,
       configuracoes: true,
@@ -398,6 +409,7 @@ export const SettingsTab: React.FC = () => {
       entradas: false,
       saidas: false,
       colaboradores: false,
+      destinos: false,
       relatorios: false,
       estatisticas: false,
       configuracoes: false,
@@ -468,6 +480,7 @@ export const SettingsTab: React.FC = () => {
         entradas: false,
         saidas: true,
         colaboradores: true,
+        destinos: true,
         relatorios: false,
         estatisticas: false,
         configuracoes: false,
@@ -987,100 +1000,6 @@ export const SettingsTab: React.FC = () => {
               </div>
             </div>
 
-            {/* 3. OBRAS E DESTINOS DAS SAÍDAS */}
-            <div className="p-3.5 sm:p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div>
-                  <h3 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
-                    <HardHat className="w-4 h-4 text-red-600 shrink-0" />
-                    Canteiros de Obras & Locais de Destino
-                  </h3>
-                  <span className="text-xs text-zinc-500">
-                    Opções disponíveis para seleção no formulário de saídas de materiais.
-                  </span>
-                </div>
-
-                <form onSubmit={handleAddDestSubmit} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
-                  <input
-                    type="text"
-                    required
-                    placeholder="Nome da nova obra..."
-                    value={newDestinationName}
-                    onChange={(e) => setNewDestinationName(e.target.value)}
-                    className="w-full sm:w-44 px-3 py-1.5 text-xs border border-zinc-300 rounded-lg focus:outline-none focus:border-red-600 bg-white"
-                  />
-                  <button
-                    type="submit"
-                    className="flex items-center justify-center gap-1 px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    Adicionar Obra
-                  </button>
-                </form>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
-                {managedLists.destinations.map((dest) => {
-                  const isEditing = editingDestinationName?.oldName === dest;
-                  return (
-                    <div
-                      key={dest}
-                      className="bg-white p-3 rounded-lg border border-zinc-200 flex items-center justify-between gap-2 shadow-2xs"
-                    >
-                      {isEditing ? (
-                        <div className="flex items-center gap-1 flex-1">
-                          <input
-                            type="text"
-                            value={editingDestinationName.currentVal}
-                            onChange={(e) =>
-                              setEditingDestinationName({
-                                ...editingDestinationName,
-                                currentVal: e.target.value,
-                              })
-                            }
-                            className="w-full px-2 py-1 text-xs border border-red-500 rounded focus:outline-none"
-                            autoFocus
-                          />
-                          <button
-                            onClick={handleSaveEditDest}
-                            className="p-1 text-emerald-600 hover:bg-emerald-50 rounded"
-                          >
-                            <Check className="w-4 h-4" />
-                          </button>
-                          <button
-                            onClick={() => setEditingDestinationName(null)}
-                            className="p-1 text-zinc-400 hover:bg-zinc-100 rounded"
-                          >
-                            <X className="w-4 h-4" />
-                          </button>
-                        </div>
-                      ) : (
-                        <>
-                          <span className="text-xs font-medium text-zinc-800 truncate">{dest}</span>
-                          <div className="flex items-center gap-1 shrink-0">
-                            <button
-                              onClick={() =>
-                                setEditingDestinationName({ oldName: dest, currentVal: dest })
-                              }
-                              className="p-1 text-zinc-400 hover:text-zinc-700 hover:bg-zinc-100 rounded"
-                            >
-                              <Edit2 className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={() => handleDeleteDest(dest)}
-                              className="p-1 text-zinc-400 hover:text-red-600 hover:bg-red-50 rounded"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
             {/* 4. COLABORADORES DE OBRA (RETIRADAS — SEM ACESSO AO APLICATIVO) */}
             <div className="p-3.5 sm:p-5 bg-zinc-50 border border-zinc-200 rounded-xl space-y-4">
               <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
@@ -1471,11 +1390,9 @@ export const SettingsTab: React.FC = () => {
                             </span>
                             <span className="text-[10px] font-mono text-zinc-500">{req.date}</span>
                           </div>
-                          {(req.role || req.department) && (
+                          {req.role && (
                             <div className="text-[11px] text-zinc-600">
-                              {req.role ? `Cargo: ${req.role}` : ''}
-                              {req.role && req.department ? ' · ' : ''}
-                              {req.department ? `Obra/Setor: ${req.department}` : ''}
+                              Cargo: {req.role}
                             </div>
                           )}
                           {req.reason && (
@@ -1566,7 +1483,7 @@ export const SettingsTab: React.FC = () => {
                           )}
                         </div>
                         <div className="text-[11px] text-zinc-500 mt-0.5">
-                          {user.role || '-'} {user.department ? `· ${user.department}` : ''}
+                          {user.role || '-'}
                         </div>
                       </div>
                       <div className="flex items-center gap-1 shrink-0">
@@ -1629,7 +1546,6 @@ export const SettingsTab: React.FC = () => {
                     <tr>
                       <th className="py-2.5 px-3">Nome do Colaborador</th>
                       <th className="py-2.5 px-3">Cargo</th>
-                      <th className="py-2.5 px-3">Departamento</th>
                       <th className="py-2.5 px-3">Status</th>
                       <th className="py-2.5 px-3 text-right">Ações</th>
                     </tr>
@@ -1650,8 +1566,7 @@ export const SettingsTab: React.FC = () => {
                             </span>
                           )}
                         </td>
-                        <td className="py-2.5 px-3 text-zinc-700">{user.role}</td>
-                        <td className="py-2.5 px-3 text-zinc-500">{user.department}</td>
+                        <td className="py-2.5 px-3 text-zinc-700">{user.role || '-'}</td>
                         <td className="py-2.5 px-3">
                           <button
                             onClick={() => handleToggleUserActive(user)}
@@ -1756,7 +1671,7 @@ export const SettingsTab: React.FC = () => {
                           )}
                         </div>
                         <div className="text-[11px] text-zinc-500 truncate">
-                          {user.role} {user.department ? `· ${user.department}` : ''}
+                          {user.role || 'Usuário'}
                         </div>
                       </div>
                     </div>
@@ -1855,6 +1770,7 @@ export const SettingsTab: React.FC = () => {
                   <th className="py-3 px-3 text-center">Entradas</th>
                   <th className="py-3 px-3 text-center">Saídas</th>
                   <th className="py-3 px-3 text-center">Colaboradores</th>
+                  <th className="py-3 px-3 text-center">Clientes/Destinos</th>
                   <th className="py-3 px-3 text-center">Relatórios</th>
                   <th className="py-3 px-3 text-center">Estatísticas</th>
                   <th className="py-3 px-3 text-center">Configurações</th>
@@ -1893,7 +1809,7 @@ export const SettingsTab: React.FC = () => {
                               )}
                             </div>
                             <div className="text-[11px] text-zinc-500">
-                              {user.role} · {user.department}
+                              {user.role || 'Usuário'}
                             </div>
                           </div>
                         </div>
@@ -2205,98 +2121,278 @@ export const SettingsTab: React.FC = () => {
             )}
           </div>
 
-          {/* Permanent Audit Log Section */}
+          {/* Permanent Audit Log Section (Hidden by default; opened on demand with day filter) */}
           <div className="bg-white p-4 sm:p-6 rounded-xl border border-zinc-200 shadow-xs space-y-4">
-            <div className="border-b border-zinc-100 pb-3">
-              <h2 className="text-base font-bold text-zinc-900 flex items-center gap-2">
-                <History className="w-5 h-5 text-zinc-700 shrink-0" />
-                Histórico e Auditoria de Exclusões Realizadas
-              </h2>
-              <p className="text-xs text-zinc-500 mt-1">
-                Registro completo de quem solicitou, justificativa, quem aprovou e quem efetivamente realizou cada exclusão no sistema.
-              </p>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-bold text-zinc-900 flex items-center gap-2">
+                  <History className="w-5 h-5 text-zinc-700 shrink-0" />
+                  Histórico e Auditoria de Exclusões Realizadas
+                  <span className="px-2 py-0.5 rounded-full bg-zinc-100 border border-zinc-200 text-[11px] font-mono font-bold text-zinc-700 tabular-nums">
+                    {deletionLogs.length}
+                  </span>
+                </h2>
+                <p className="text-xs text-zinc-500 mt-1">
+                  Consulte quando desejar o histórico completo de solicitações, justificativas, aprovações e exclusões realizadas.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowDeletionHistory((prev) => !prev)}
+                className={`w-full sm:w-auto flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer border ${
+                  showDeletionHistory
+                    ? 'bg-zinc-900 text-white border-zinc-900 hover:bg-zinc-800'
+                    : 'bg-zinc-50 text-zinc-900 border-zinc-300 hover:bg-zinc-100'
+                }`}
+              >
+                <History className="w-4 h-4 text-red-500 shrink-0" />
+                <span>
+                  {showDeletionHistory
+                    ? 'Ocultar Histórico de Exclusões'
+                    : `Visualizar Histórico de Exclusões (${deletionLogs.length})`}
+                </span>
+                {showDeletionHistory ? (
+                  <ChevronUp className="w-4 h-4 shrink-0" />
+                ) : (
+                  <ChevronDown className="w-4 h-4 shrink-0" />
+                )}
+              </button>
             </div>
 
-            {deletionLogs.length === 0 ? (
-              <p className="text-xs text-zinc-500 py-8 text-center">
-                Nenhuma exclusão auditada foi registrada até o momento.
-              </p>
-            ) : (
-              <div className="space-y-3">
-                {deletionLogs.map((log) => (
-                  <div
-                    key={log.id}
-                    className="p-3.5 rounded-xl border border-zinc-200 bg-zinc-50/70 space-y-2.5 text-xs"
-                  >
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                      <div className="flex flex-wrap items-center gap-2 min-w-0">
-                        <span
-                          className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase shrink-0 ${
-                            log.origin === 'APROVADA'
-                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                              : 'bg-zinc-200 text-zinc-800 border border-zinc-300'
-                          }`}
-                        >
-                          {log.origin === 'APROVADA' ? 'Via Solicitação Aprovada' : 'Exclusão Direta'}
-                        </span>
-                        <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-zinc-900 text-white shrink-0">
-                          {getRecordTypeLabel(log.recordType)}
-                        </span>
-                        {log.targetCode && (
-                          <span className="font-mono font-bold bg-white px-2 py-0.5 rounded border border-zinc-300 shrink-0">
-                            {log.targetCode}
-                          </span>
-                        )}
-                        <strong className="text-zinc-900">{log.targetName}</strong>
-                        {log.recordType === 'COLABORADOR' ? (
-                          log.quantity > 0 && (
-                            <span className="font-mono text-zinc-600">
-                              ({log.quantity} retirada{log.quantity === 1 ? '' : 's'})
-                            </span>
-                          )
-                        ) : (
-                          <span className="font-mono text-zinc-600">({log.quantity} un)</span>
-                        )}
-                      </div>
-                      <span className="text-[11px] font-mono text-zinc-500 shrink-0">
-                        {log.deletedAt}
-                      </span>
-                    </div>
-
-                    {log.targetDetails && (
-                      <div className="text-[11px] text-zinc-600">{log.targetDetails}</div>
-                    )}
-
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 bg-white p-2.5 rounded-lg border border-zinc-200 text-[11px]">
-                      <div>
-                        <span className="text-zinc-500 block">Solicitado por:</span>
-                        <strong className="text-zinc-900">{log.requestedBy}</strong>
-                        <span className="block text-zinc-500 font-mono">{log.requestedByDate}</span>
-                      </div>
-                      <div>
-                        <span className="text-zinc-500 block">Aprovação:</span>
-                        {log.origin === 'APROVADA' && log.approvedBy ? (
-                          <>
-                            <strong className="text-emerald-800">{log.approvedBy}</strong>
-                            <span className="block text-zinc-500 font-mono">{log.approvedAt}</span>
-                          </>
-                        ) : (
-                          <strong className="text-zinc-700">Não necessária (Permissão Direta)</strong>
-                        )}
-                      </div>
-                      <div>
-                        <span className="text-zinc-500 block">Excluído por:</span>
-                        <strong className="text-red-700">{log.deletedBy}</strong>
-                        <span className="block text-zinc-500 truncate">{log.deletedByEmail}</span>
-                      </div>
-                    </div>
-
-                    <div className="text-[11px] text-zinc-700 bg-white px-2.5 py-2 rounded border border-zinc-200">
-                      <strong className="text-zinc-900">Justificativa: </strong>
-                      {log.reason}
-                    </div>
+            {showDeletionHistory && (
+              <div className="pt-4 border-t border-zinc-200 space-y-4">
+                {/* Day-period filter bar */}
+                <div className="p-3.5 bg-zinc-50 border border-zinc-200 rounded-xl flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] font-bold text-zinc-600 uppercase tracking-wider flex items-center gap-1.5 mr-1">
+                      <Calendar className="w-3.5 h-3.5 text-red-600" />
+                      Período:
+                    </span>
+                    {(
+                      [
+                        { id: 'ALL', label: 'Todos' },
+                        { id: '7', label: 'Últimos 7 dias' },
+                        { id: '15', label: 'Últimos 15 dias' },
+                        { id: '30', label: 'Últimos 30 dias' },
+                        { id: '90', label: 'Últimos 90 dias' },
+                        { id: 'CUSTOM', label: 'Personalizado' },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setHistoryDaysFilter(opt.id)}
+                        className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer whitespace-nowrap ${
+                          historyDaysFilter === opt.id
+                            ? 'bg-zinc-900 text-white border-zinc-900'
+                            : 'bg-white text-zinc-700 border-zinc-300 hover:bg-zinc-100'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
                   </div>
-                ))}
+
+                  <div className="flex flex-wrap items-center justify-between lg:justify-end gap-3">
+                    {historyDaysFilter === 'CUSTOM' && (
+                      <div className="flex items-center gap-1.5">
+                        <label
+                          htmlFor="customAuditDaysInput"
+                          className="text-[11px] font-semibold text-zinc-700 whitespace-nowrap"
+                        >
+                          Quantidade de dias:
+                        </label>
+                        <input
+                          id="customAuditDaysInput"
+                          type="number"
+                          min={1}
+                          max={3650}
+                          value={historyCustomDays}
+                          onChange={(e) => setHistoryCustomDays(e.target.value)}
+                          className="w-20 px-2.5 py-1 text-xs font-mono border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
+                        />
+                      </div>
+                    )}
+                    <span className="text-[11px] font-medium text-zinc-600">
+                      Exibindo <strong className="font-mono text-zinc-900">{filteredDeletionLogs.length}</strong> de{' '}
+                      <strong className="font-mono text-zinc-900">{deletionLogs.length}</strong> exclusões
+                    </span>
+                  </div>
+                </div>
+
+                {filteredDeletionLogs.length === 0 ? (
+                  <p className="text-xs text-zinc-500 py-8 text-center bg-zinc-50 rounded-xl border border-dashed border-zinc-200">
+                    {deletionLogs.length === 0
+                      ? 'Nenhuma exclusão auditada foi registrada até o momento.'
+                      : 'Nenhuma exclusão encontrada dentro do período selecionado.'}
+                  </p>
+                ) : (
+                  <>
+                    {/* Mobile Cards */}
+                    <div className="lg:hidden space-y-3">
+                      {filteredDeletionLogs.map((log) => (
+                        <div
+                          key={log.id}
+                          className="p-3.5 rounded-xl border border-zinc-200 bg-zinc-50/70 space-y-2.5 text-xs"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span
+                                className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase ${
+                                  log.origin === 'APROVADA'
+                                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                    : 'bg-zinc-200 text-zinc-800 border border-zinc-300'
+                                }`}
+                              >
+                                {log.origin === 'APROVADA' ? 'Aprovada' : 'Direta'}
+                              </span>
+                              <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-zinc-900 text-white">
+                                {getRecordTypeLabel(log.recordType)}
+                              </span>
+                            </div>
+                            <span className="text-[11px] font-mono text-zinc-500">{log.deletedAt}</span>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {log.targetCode && (
+                              <span className="font-mono font-bold bg-white px-2 py-0.5 rounded border border-zinc-300 text-[11px]">
+                                {log.targetCode}
+                              </span>
+                            )}
+                            <strong className="text-zinc-900">{log.targetName}</strong>
+                            <span className="font-mono text-[11px] text-zinc-600">
+                              {log.recordType === 'COLABORADOR'
+                                ? log.quantity > 0
+                                  ? `(${log.quantity} retirada${log.quantity === 1 ? '' : 's'})`
+                                  : ''
+                                : `(${log.quantity} un)`}
+                            </span>
+                          </div>
+
+                          {log.targetDetails && (
+                            <div className="text-[11px] text-zinc-600">{log.targetDetails}</div>
+                          )}
+
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 bg-white p-2.5 rounded-lg border border-zinc-200 text-[11px]">
+                            <div>
+                              <span className="text-zinc-500 block">Solicitado por:</span>
+                              <strong className="text-zinc-900">{log.requestedBy}</strong>
+                              <span className="block text-zinc-500 font-mono">{log.requestedByDate}</span>
+                            </div>
+                            <div>
+                              <span className="text-zinc-500 block">Aprovação:</span>
+                              {log.origin === 'APROVADA' && log.approvedBy ? (
+                                <>
+                                  <strong className="text-emerald-800">{log.approvedBy}</strong>
+                                  <span className="block text-zinc-500 font-mono">{log.approvedAt}</span>
+                                </>
+                              ) : (
+                                <strong className="text-zinc-700">Permissão Direta</strong>
+                              )}
+                            </div>
+                            <div>
+                              <span className="text-zinc-500 block">Excluído por:</span>
+                              <strong className="text-red-700">{log.deletedBy}</strong>
+                              <span className="block text-zinc-500 truncate">{log.deletedByEmail}</span>
+                            </div>
+                          </div>
+
+                          <div className="text-[11px] text-zinc-700 bg-white px-2.5 py-2 rounded border border-zinc-200">
+                            <strong className="text-zinc-900">Justificativa: </strong>
+                            {log.reason}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Desktop Organized Audit Table */}
+                    <div className="hidden lg:block overflow-x-auto border border-zinc-200 rounded-xl">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-zinc-900 text-zinc-200 uppercase tracking-wider text-[11px] font-semibold">
+                          <tr>
+                            <th className="py-3 px-3.5 whitespace-nowrap">Data / Hora</th>
+                            <th className="py-3 px-3.5">Origem / Tipo</th>
+                            <th className="py-3 px-3.5">Item / Registro Excluído</th>
+                            <th className="py-3 px-3.5">Solicitante & Justificativa</th>
+                            <th className="py-3 px-3.5">Aprovação & Executor</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-zinc-200 bg-white">
+                          {filteredDeletionLogs.map((log) => (
+                            <tr key={log.id} className="hover:bg-zinc-50/80 align-top">
+                              <td className="py-3 px-3.5 font-mono text-[11px] text-zinc-600 whitespace-nowrap tabular-nums">
+                                {log.deletedAt}
+                              </td>
+                              <td className="py-3 px-3.5 space-y-1.5 whitespace-nowrap">
+                                <span
+                                  className={`inline-block text-[10px] font-bold px-2 py-0.5 rounded uppercase ${
+                                    log.origin === 'APROVADA'
+                                      ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                      : 'bg-zinc-200 text-zinc-800 border border-zinc-300'
+                                  }`}
+                                >
+                                  {log.origin === 'APROVADA' ? 'Via Aprovação' : 'Exclusão Direta'}
+                                </span>
+                                <div>
+                                  <span className="inline-block text-[10px] font-bold px-2 py-0.5 rounded bg-zinc-900 text-white">
+                                    {getRecordTypeLabel(log.recordType)}
+                                  </span>
+                                </div>
+                              </td>
+                              <td className="py-3 px-3.5 min-w-[200px]">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  {log.targetCode && (
+                                    <span className="font-mono font-bold text-[11px] bg-zinc-100 px-1.5 py-0.5 rounded border border-zinc-300">
+                                      {log.targetCode}
+                                    </span>
+                                  )}
+                                  <strong className="text-zinc-900">{log.targetName}</strong>
+                                  <span className="font-mono text-[11px] text-zinc-600">
+                                    {log.recordType === 'COLABORADOR'
+                                      ? log.quantity > 0
+                                        ? `(${log.quantity} ret.)`
+                                        : ''
+                                      : `(${log.quantity} un)`}
+                                  </span>
+                                </div>
+                                {log.targetDetails && (
+                                  <p className="text-[11px] text-zinc-500 mt-1">{log.targetDetails}</p>
+                                )}
+                              </td>
+                              <td className="py-3 px-3.5 min-w-[220px]">
+                                <div className="font-semibold text-zinc-900">{log.requestedBy}</div>
+                                <div className="text-[11px] font-mono text-zinc-500">
+                                  {log.requestedByDate}
+                                </div>
+                                <div className="text-[11px] text-zinc-700 mt-1 bg-zinc-50 p-2 rounded border border-zinc-200">
+                                  {log.reason}
+                                </div>
+                              </td>
+                              <td className="py-3 px-3.5 min-w-[190px] space-y-1.5 text-[11px]">
+                                <div>
+                                  <span className="text-zinc-500">Aprovação: </span>
+                                  {log.origin === 'APROVADA' && log.approvedBy ? (
+                                    <strong className="text-emerald-800">
+                                      {log.approvedBy} ({log.approvedAt})
+                                    </strong>
+                                  ) : (
+                                    <span className="text-zinc-700 font-medium">Permissão Direta</span>
+                                  )}
+                                </div>
+                                <div>
+                                  <span className="text-zinc-500">Excluído por: </span>
+                                  <strong className="text-red-700">{log.deletedBy}</strong>
+                                  <span className="block text-zinc-500 truncate">{log.deletedByEmail}</span>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -2636,48 +2732,30 @@ export const SettingsTab: React.FC = () => {
                 />
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                    Cargo / Função *
-                  </label>
-                  <select
-                    required
-                    value={userFormData.role}
-                    onChange={(e) => setUserFormData({ ...userFormData, role: e.target.value })}
-                    className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white"
-                  >
-                    <option value="">
-                      {managedLists.roles.length === 0
-                        ? 'Cadastre um cargo na Lista de Cargos...'
-                        : 'Selecione um cargo...'}
+              <div>
+                <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                  Cargo / Função
+                </label>
+                <select
+                  value={userFormData.role}
+                  onChange={(e) => setUserFormData({ ...userFormData, role: e.target.value })}
+                  className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white"
+                >
+                  <option value="">
+                    {managedLists.roles.length === 0
+                      ? 'Nenhum cargo cadastrado (opcional)...'
+                      : 'Selecione um cargo (opcional)...'}
+                  </option>
+                  {userFormData.role &&
+                    !managedLists.roles.includes(userFormData.role) && (
+                      <option value={userFormData.role}>{userFormData.role}</option>
+                    )}
+                  {managedLists.roles.map((r) => (
+                    <option key={r} value={r}>
+                      {r}
                     </option>
-                    {userFormData.role &&
-                      !managedLists.roles.includes(userFormData.role) && (
-                        <option value={userFormData.role}>{userFormData.role}</option>
-                      )}
-                    {managedLists.roles.map((r) => (
-                      <option key={r} value={r}>
-                        {r}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                    Departamento
-                  </label>
-                  <input
-                    type="text"
-                    value={userFormData.department}
-                    onChange={(e) =>
-                      setUserFormData({ ...userFormData, department: e.target.value })
-                    }
-                    className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg"
-                    placeholder="Ex: Obras Eletromecânicas"
-                  />
-                </div>
+                  ))}
+                </select>
               </div>
 
               <div className="space-y-2.5 pt-1">

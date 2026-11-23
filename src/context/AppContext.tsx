@@ -49,6 +49,7 @@ import {
   resetAllDataApi,
   toggleCollaboratorActiveApi,
   updateCollaboratorApi,
+  updateDestinationsApi,
   updateManagedListsApi,
   updateProductApi,
   updateSettingsApi,
@@ -111,6 +112,8 @@ interface AppContextType {
   signInWithGoogle: () => Promise<void>;
   signOutGoogle: () => Promise<void>;
   retryBootstrap: () => Promise<boolean>;
+  isRefreshing: boolean;
+  refreshData: () => Promise<boolean>;
   submitAccessRequest: (params: {
     name: string;
     email: string;
@@ -241,6 +244,7 @@ const ALL_TAB_IDS: TabId[] = [
   'entradas',
   'saidas',
   'colaboradores',
+  'destinos',
   'relatorios',
   'estatisticas',
   'configuracoes',
@@ -262,6 +266,7 @@ const FALLBACK_OWNER_USER: User = {
     entradas: true,
     saidas: true,
     colaboradores: true,
+    destinos: true,
     relatorios: true,
     estatisticas: true,
     configuracoes: true,
@@ -286,6 +291,7 @@ function normalizePermissions(perms?: Partial<UserPermissions> | null): UserPerm
     saidas: Boolean(perms?.saidas),
     colaboradores:
       perms?.colaboradores !== undefined ? Boolean(perms.colaboradores) : Boolean(perms?.saidas),
+    destinos: perms?.destinos !== undefined ? Boolean(perms.destinos) : true,
     relatorios: Boolean(perms?.relatorios),
     estatisticas: Boolean(perms?.estatisticas),
     configuracoes: Boolean(perms?.configuracoes),
@@ -355,6 +361,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [activeTab, setActiveTabState] = useState<TabId>('dashboard');
   const [settingsInitialSubTab, setSettingsInitialSubTab] = useState<SettingsSubTab>('listas');
   const [selectedProductForModal, setSelectedProductForModal] = useState<Product | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
 
   const settingsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -385,6 +392,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       applyBootstrapData(data);
     } catch (err) {
       console.error('Failed to refresh bootstrap data:', err);
+    }
+  }, [applyBootstrapData]);
+
+  const refreshData = useCallback(async (): Promise<boolean> => {
+    if (!auth.currentUser) return false;
+    setIsRefreshing(true);
+    try {
+      const data = await fetchBootstrapData(true);
+      applyBootstrapData(data);
+      return true;
+    } catch (err) {
+      console.error('Failed to refresh app data:', err);
+      return false;
+    } finally {
+      setIsRefreshing(false);
     }
   }, [applyBootstrapData]);
 
@@ -967,7 +989,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         destinations: [...managedLists.destinations, trimmed],
       };
       setManagedLists(next);
-      void updateManagedListsApi({ lists: next }).then(() => refreshBootstrap());
+      void updateDestinationsApi(next.destinations)
+        .then(() => refreshBootstrap())
+        .catch(() => refreshBootstrap());
       return true;
     },
     [managedLists, refreshBootstrap]
@@ -982,7 +1006,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         destinations: managedLists.destinations.map((d) => (d === oldName ? trimmed : d)),
       };
       setManagedLists(next);
-      void updateManagedListsApi({ lists: next }).then(() => refreshBootstrap());
+      void updateDestinationsApi(next.destinations)
+        .then(() => refreshBootstrap())
+        .catch(() => refreshBootstrap());
       return true;
     },
     [managedLists, refreshBootstrap]
@@ -995,7 +1021,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         destinations: managedLists.destinations.filter((d) => d !== name),
       };
       setManagedLists(next);
-      void updateManagedListsApi({ lists: next }).then(() => refreshBootstrap());
+      void updateDestinationsApi(next.destinations)
+        .then(() => refreshBootstrap())
+        .catch(() => refreshBootstrap());
       return true;
     },
     [managedLists, refreshBootstrap]
@@ -1689,6 +1717,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         signInWithGoogle,
         signOutGoogle,
         retryBootstrap,
+        isRefreshing,
+        refreshData,
         submitAccessRequest,
         accessRequests,
         pendingAccessRequestsCount,

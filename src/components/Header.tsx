@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
-import { Eye, EyeOff, ChevronDown, Check, Sliders, LogOut, Menu, KeyRound, X } from 'lucide-react';
+import { Eye, EyeOff, ChevronDown, Check, Sliders, LogOut, Menu, KeyRound, X, RefreshCw } from 'lucide-react';
 import { TabId } from '../types';
 
 interface HeaderProps {
@@ -20,9 +20,12 @@ export const Header: React.FC<HeaderProps> = ({ onToggleMobileMenu }) => {
     firebaseUser,
     signOutGoogle,
     linkOrUpdateEmailPassword,
+    isRefreshing,
+    refreshData,
   } = useApp();
 
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
+  const [justRefreshed, setJustRefreshed] = useState(false);
   const [passwordModalOpen, setPasswordModalOpen] = useState(false);
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -38,9 +41,19 @@ export const Header: React.FC<HeaderProps> = ({ onToggleMobileMenu }) => {
     entradas: 'Entradas de Materiais',
     saidas: 'Requisições & Saídas de Materiais',
     colaboradores: 'Colaboradores & Histórico de Retiradas',
+    destinos: 'Clientes e Locais de Destino',
     relatorios: 'Relatórios do Almoxarifado',
     estatisticas: 'Estatísticas & Análise de Giro',
     configuracoes: 'Permissões & Configurações',
+  };
+
+  const handleRefresh = async () => {
+    if (isRefreshing) return;
+    const ok = await refreshData();
+    if (ok) {
+      setJustRefreshed(true);
+      setTimeout(() => setJustRefreshed(false), 2000);
+    }
   };
 
   const handleTogglePhotos = () => {
@@ -84,8 +97,26 @@ export const Header: React.FC<HeaderProps> = ({ onToggleMobileMenu }) => {
           <span className="text-zinc-400 font-mono text-[11px]">Unidade Central</span>
         </div>
 
-        {/* Zone 3: Actions (Photos Toggle, RBAC Switcher for Admin, & Sign Out) */}
-        <div className="flex items-center gap-1.5 sm:gap-3 shrink-0">
+        {/* Zone 3: Actions (Refresh, Photos Toggle, RBAC Switcher for Admin, & Sign Out) */}
+        <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
+          {/* Manual Refresh Button */}
+          <button
+            type="button"
+            onClick={() => void handleRefresh()}
+            disabled={isRefreshing}
+            title="Atualizar informações do aplicativo sem sair"
+            className={`flex items-center gap-1.5 px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-all border whitespace-nowrap shrink-0 cursor-pointer ${
+              justRefreshed
+                ? 'bg-emerald-950/70 text-emerald-300 border-emerald-700'
+                : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-200 border-zinc-700 hover:border-zinc-500'
+            }`}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isRefreshing ? 'animate-spin text-red-400' : justRefreshed ? 'text-emerald-400' : 'text-zinc-300'}`} />
+            <span className="hidden xs:inline sm:inline">
+              {isRefreshing ? 'Atualizando...' : justRefreshed ? 'Atualizado' : 'Atualizar'}
+            </span>
+          </button>
+
           {/* Quick Toggle for Product Photos */}
           <button
             onClick={handleTogglePhotos}
@@ -187,7 +218,7 @@ export const Header: React.FC<HeaderProps> = ({ onToggleMobileMenu }) => {
                                   )}
                                 </div>
                                 <div className="text-[10px] text-zinc-400 truncate">
-                                  {user.department || user.role}
+                                  {user.role || 'Usuário do Sistema'}
                                 </div>
                               </div>
                             </div>

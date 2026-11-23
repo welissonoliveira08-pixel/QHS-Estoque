@@ -506,6 +506,39 @@ export async function resolveAuthenticatedUserSupabase(params: {
   };
 }
 
+const ACCESS_REQUESTS_STORE_ID = 'access_requests_store';
+
+function isMissingTableDomainError(err: unknown): boolean {
+  if (err instanceof DomainError && err.statusCode === 503 && err.message.includes('Tabela não encontrada')) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return msg.includes('PGRST205') || msg.includes('42P01') || msg.includes('Tabela não encontrada');
+}
+
+async function readFallbackAccessRequestsSupabase(): Promise<DbRow[]> {
+  const rows = await sbRequest<DbRow[]>(
+    `managed_lists?id=eq.${ACCESS_REQUESTS_STORE_ID}&limit=1`
+  );
+  const store = rows[0];
+  if (!store || !Array.isArray(store.groups)) return [];
+  return store.groups as DbRow[];
+}
+
+async function writeFallbackAccessRequestsSupabase(rows: DbRow[]): Promise<void> {
+  await sbRequest('managed_lists?on_conflict=id', {
+    method: 'POST',
+    prefer: 'resolution=merge-duplicates,return=minimal',
+    body: {
+      id: ACCESS_REQUESTS_STORE_ID,
+      groups: rows,
+      roles: [],
+      destinations: [],
+      updated_at: new Date().toISOString(),
+    },
+  });
+}
+
 export async function getBootstrapDataSupabase(currentUser: User, uid: string) {
   await ensureDefaultsSeededSupabase();
 
@@ -535,7 +568,7 @@ export async function getBootstrapDataSupabase(currentUser: User, uid: string) {
     currentUser.isAdmin
       ? sbRequest<DbRow[]>('access_requests?select=*', { ignoreMissingTable: true })
       : Promise.resolve([]),
-    sbRequest<DbRow[]>('managed_lists?id=eq.global&limit=1'),
+    sbRequest<DbRow[]>(`managed_lists?id=in.(global,${ACCESS_REQUESTS_STORE_ID})`),
     sbRequest<DbRow[]>('system_settings?id=eq.global&limit=1'),
   ]);
 
@@ -554,7 +587,18 @@ export async function getBootstrapDataSupabase(currentUser: User, uid: string) {
           })),
       ];
 
-  const listsRow = listsRows[0];
+  const listsRow = listsRows.find((r) => r.id === 'global');
+  const fallbackStoreRow = listsRows.find((r) => r.id === ACCESS_REQUESTS_STORE_ID);
+  const fallbackAccessReqRows =
+    currentUser.isAdmin &&
+    accessReqRows.length === 0 &&
+    fallbackStoreRow &&
+    Array.isArray(fallbackStoreRow.groups)
+      ? (fallbackStoreRow.groups as DbRow[])
+      : [];
+  const effectiveAccessReqRows =
+    accessReqRows.length > 0 ? accessReqRows : fallbackAccessReqRows;
+
   const lists: ManagedLists = listsRow
     ? {
         groups: Array.isArray(listsRow.groups) ? (listsRow.groups as string[]) : INITIAL_LISTS.groups,
@@ -588,7 +632,9 @@ export async function getBootstrapDataSupabase(currentUser: User, uid: string) {
     negativeRequests: negRows.map(mapNegativeRequest).sort((a, b) => b.date.localeCompare(a.date)),
     deletionRequests: delReqRows.map(mapDeletionRequest).sort((a, b) => b.date.localeCompare(a.date)),
     deletionLogs: delLogRows.map(mapDeletionLog).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt)),
-    accessRequests: accessReqRows.map(mapAccessRequest).sort((a, b) => b.date.localeCompare(a.date)),
+    accessRequests: effectiveAccessReqRows
+      .map(mapAccessRequest)
+      .sort((a, b) => b.date.localeCompare(a.date)),
     managedLists: lists,
     settings,
   };
@@ -665,10 +711,31 @@ export async function updateManagedListsSupabase(params: {
   }
 }
 
+export async function updateDestinationsSupabase(destinations: string[]) {
+  await ensureDefaultsSeededSupabase();
+  await sbRequest('managed_lists?id=eq.global', {
+    method: 'PATCH',
+    prefer: 'return=minimal',
+    body: {
+      destinations: destinations
+        .map((d) => String(d || '').trim().slice(0, 120))
+        .filter(Boolean)
+        .slice(0, 150),
+      updated_at: new Date().toISOString(),
+    },
+  });
+}
+
 export async function createUserSupabase(newUser: Omit<User, 'id' | 'createdAt'>) {
   const emailLower = newUser.email.trim().toLowerCase();
   if (!emailLower || !newUser.name.trim()) {
     throw new DomainError('Nome e e-mail do usuário são obrigatórios.', 400);
+  }
+  const existing = await sbRequest<DbRow[]>(
+    `users?email=eq.${encodeURIComponent(emailLower)}&select=id&limit=1`
+  );
+  if (existing[0]) {
+    throw new DomainError('Já existe um usuário cadastrado com este e-mail.', 409);
   }
   const inserted = await sbRequest<DbRow[]>('users', {
     method: 'POST',
@@ -692,6 +759,12 @@ export async function createUserSupabase(newUser: Omit<User, 'id' | 'createdAt'>
 
 export async function updateUserSupabase(updatedUser: User) {
   const emailLower = updatedUser.email.trim().toLowerCase();
+  const duplicate = await sbRequest<DbRow[]>(
+    `users?email=eq.${encodeURIComponent(emailLower)}&select=id&limit=1`
+  );
+  if (duplicate[0] && String(duplicate[0].id) !== updatedUser.id) {
+    throw new DomainError('Já existe outro usuário cadastrado com este e-mail.', 409);
+  }
   const updated = await sbRequest<DbRow[]>(
     `users?id=eq.${encodeURIComponent(updatedUser.id)}`,
     {
@@ -788,43 +861,93 @@ export async function createAccessRequestSupabase(params: {
     return {
       alreadyAuthorized: true,
       message:
-        'Este e-mail já está autorizado! Use a aba "Primeiro Acesso" para criar sua senha ou clique em "Continuar com conta Google".',
+        'Este e-mail já está autorizado! Use a aba "1º Acesso" para criar sua senha ou clique em "Continuar com conta Google".',
     };
   }
-
-  const existingPending = await sbRequest<DbRow[]>(
-    `access_requests?email=eq.${encodeURIComponent(emailLower)}&status=eq.PENDENTE&limit=1`
-  );
 
   const nowFormatted = formatDateTimeNow();
 
-  if (existingPending[0]) {
-    const updated = await sbRequest<DbRow[]>(
-      `access_requests?id=eq.${encodeURIComponent(String(existingPending[0].id))}`,
-      {
-        method: 'PATCH',
-        prefer: 'return=representation',
-        body: {
-          name: cleanName.slice(0, 120),
-          role: (params.role || '').trim().slice(0, 100),
-          department: (params.department || '').trim().slice(0, 100),
-          reason: (params.reason || '').trim().slice(0, 500),
-          date: nowFormatted,
-          updated_at: new Date().toISOString(),
-        },
-      }
+  try {
+    const existingPending = await sbRequest<DbRow[]>(
+      `access_requests?email=eq.${encodeURIComponent(emailLower)}&status=eq.PENDENTE&limit=1`
     );
-    return {
-      request: mapAccessRequest(updated[0]),
-      message:
-        'Seu pedido de acesso foi atualizado e reenviado ao Administrador da QHS Engenharia! Assim que aprovado, você poderá entrar no aplicativo.',
-    };
-  }
 
-  const inserted = await sbRequest<DbRow[]>('access_requests', {
-    method: 'POST',
-    prefer: 'return=representation',
-    body: {
+    if (existingPending[0]) {
+      const updated = await sbRequest<DbRow[]>(
+        `access_requests?id=eq.${encodeURIComponent(String(existingPending[0].id))}`,
+        {
+          method: 'PATCH',
+          prefer: 'return=representation',
+          body: {
+            name: cleanName.slice(0, 120),
+            role: (params.role || '').trim().slice(0, 100),
+            department: (params.department || '').trim().slice(0, 100),
+            reason: (params.reason || '').trim().slice(0, 500),
+            date: nowFormatted,
+            updated_at: new Date().toISOString(),
+          },
+        }
+      );
+      return {
+        request: mapAccessRequest(updated[0]),
+        message:
+          'Seu pedido de acesso foi atualizado e reenviado ao Administrador da QHS Engenharia! Assim que aprovado, você poderá entrar no aplicativo.',
+      };
+    }
+
+    const inserted = await sbRequest<DbRow[]>('access_requests', {
+      method: 'POST',
+      prefer: 'return=representation',
+      body: {
+        id: `acc-req-${Date.now()}`,
+        org_id: ORG_ID,
+        name: cleanName.slice(0, 120),
+        email: emailLower.slice(0, 200),
+        role: (params.role || '').trim().slice(0, 100),
+        department: (params.department || '').trim().slice(0, 100),
+        reason: (params.reason || '').trim().slice(0, 500),
+        date: nowFormatted,
+        status: 'PENDENTE',
+        updated_at: new Date().toISOString(),
+      },
+    });
+
+    return {
+      request: mapAccessRequest(inserted[0]),
+      message:
+        'Pedido enviado com sucesso ao Administrador! Aguarde a aprovação e tente entrar novamente.',
+    };
+  } catch (err) {
+    if (!isMissingTableDomainError(err)) throw err;
+
+    const storeRows = await readFallbackAccessRequestsSupabase();
+    const existingIdx = storeRows.findIndex(
+      (r) =>
+        String(r.email || '').trim().toLowerCase() === emailLower &&
+        String(r.status || '') === 'PENDENTE'
+    );
+
+    if (existingIdx >= 0) {
+      const updatedRow: DbRow = {
+        ...storeRows[existingIdx],
+        name: cleanName.slice(0, 120),
+        role: (params.role || '').trim().slice(0, 100),
+        department: (params.department || '').trim().slice(0, 100),
+        reason: (params.reason || '').trim().slice(0, 500),
+        date: nowFormatted,
+        updated_at: new Date().toISOString(),
+      };
+      const nextStore = [...storeRows];
+      nextStore[existingIdx] = updatedRow;
+      await writeFallbackAccessRequestsSupabase(nextStore);
+      return {
+        request: mapAccessRequest(updatedRow),
+        message:
+          'Seu pedido de acesso foi atualizado e reenviado ao Administrador da QHS Engenharia! Assim que aprovado, você poderá entrar no aplicativo.',
+      };
+    }
+
+    const newRow: DbRow = {
       id: `acc-req-${Date.now()}`,
       org_id: ORG_ID,
       name: cleanName.slice(0, 120),
@@ -834,15 +957,16 @@ export async function createAccessRequestSupabase(params: {
       reason: (params.reason || '').trim().slice(0, 500),
       date: nowFormatted,
       status: 'PENDENTE',
+      created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    },
-  });
-
-  return {
-    request: mapAccessRequest(inserted[0]),
-    message:
-      'Pedido enviado com sucesso ao Administrador! Aguarde a aprovação e tente entrar novamente.',
-  };
+    };
+    await writeFallbackAccessRequestsSupabase([newRow, ...storeRows]);
+    return {
+      request: mapAccessRequest(newRow),
+      message:
+        'Pedido enviado com sucesso ao Administrador! Aguarde a aprovação e tente entrar novamente.',
+    };
+  }
 }
 
 export async function approveAccessRequestSupabase(params: {
@@ -853,10 +977,31 @@ export async function approveAccessRequestSupabase(params: {
   canDelete?: boolean;
   permissions?: Partial<UserPermissions>;
 }) {
-  const reqRows = await sbRequest<DbRow[]>(
-    `access_requests?id=eq.${encodeURIComponent(params.requestId)}&limit=1`
-  );
-  const reqRow = reqRows[0];
+  let reqRow: DbRow | undefined;
+  let usingFallbackStore = false;
+  let fallbackRows: DbRow[] = [];
+
+  try {
+    const reqRows = await sbRequest<DbRow[]>(
+      `access_requests?id=eq.${encodeURIComponent(params.requestId)}&limit=1`
+    );
+    reqRow = reqRows[0];
+  } catch (err) {
+    if (!isMissingTableDomainError(err)) throw err;
+    usingFallbackStore = true;
+    fallbackRows = await readFallbackAccessRequestsSupabase();
+    reqRow = fallbackRows.find((r) => String(r.id) === params.requestId);
+  }
+
+  if (!reqRow && !usingFallbackStore) {
+    fallbackRows = await readFallbackAccessRequestsSupabase();
+    const fallbackMatch = fallbackRows.find((r) => String(r.id) === params.requestId);
+    if (fallbackMatch) {
+      usingFallbackStore = true;
+      reqRow = fallbackMatch;
+    }
+  }
+
   if (!reqRow) throw new DomainError('Pedido de acesso não encontrado.', 404);
   if (reqRow.status !== 'PENDENTE') {
     throw new DomainError('Este pedido de acesso já foi analisado.', 400);
@@ -870,6 +1015,7 @@ export async function approveAccessRequestSupabase(params: {
       entradas: false,
       saidas: true,
       colaboradores: true,
+      destinos: true,
       relatorios: false,
       estatisticas: false,
       configuracoes: false,
@@ -922,6 +1068,24 @@ export async function approveAccessRequestSupabase(params: {
     savedUserRow = insertedUsers[0];
   }
 
+  const reviewedAt = formatDateTimeNow();
+  if (usingFallbackStore) {
+    const updatedReqRow: DbRow = {
+      ...reqRow,
+      status: 'APROVADO',
+      reviewed_by: params.admin.name.slice(0, 120),
+      reviewed_at: reviewedAt,
+      updated_at: new Date().toISOString(),
+    };
+    await writeFallbackAccessRequestsSupabase(
+      fallbackRows.map((r) => (String(r.id) === params.requestId ? updatedReqRow : r))
+    );
+    return {
+      user: mapUser(savedUserRow),
+      request: mapAccessRequest(updatedReqRow),
+    };
+  }
+
   const updatedReqs = await sbRequest<DbRow[]>(
     `access_requests?id=eq.${encodeURIComponent(params.requestId)}`,
     {
@@ -930,7 +1094,7 @@ export async function approveAccessRequestSupabase(params: {
       body: {
         status: 'APROVADO',
         reviewed_by: params.admin.name.slice(0, 120),
-        reviewed_at: formatDateTimeNow(),
+        reviewed_at: reviewedAt,
         updated_at: new Date().toISOString(),
       },
     }
@@ -943,13 +1107,49 @@ export async function approveAccessRequestSupabase(params: {
 }
 
 export async function rejectAccessRequestSupabase(params: { requestId: string; admin: User }) {
-  const reqRows = await sbRequest<DbRow[]>(
-    `access_requests?id=eq.${encodeURIComponent(params.requestId)}&limit=1`
-  );
-  const reqRow = reqRows[0];
+  let reqRow: DbRow | undefined;
+  let usingFallbackStore = false;
+  let fallbackRows: DbRow[] = [];
+
+  try {
+    const reqRows = await sbRequest<DbRow[]>(
+      `access_requests?id=eq.${encodeURIComponent(params.requestId)}&limit=1`
+    );
+    reqRow = reqRows[0];
+  } catch (err) {
+    if (!isMissingTableDomainError(err)) throw err;
+    usingFallbackStore = true;
+    fallbackRows = await readFallbackAccessRequestsSupabase();
+    reqRow = fallbackRows.find((r) => String(r.id) === params.requestId);
+  }
+
+  if (!reqRow && !usingFallbackStore) {
+    fallbackRows = await readFallbackAccessRequestsSupabase();
+    const fallbackMatch = fallbackRows.find((r) => String(r.id) === params.requestId);
+    if (fallbackMatch) {
+      usingFallbackStore = true;
+      reqRow = fallbackMatch;
+    }
+  }
+
   if (!reqRow) throw new DomainError('Pedido de acesso não encontrado.', 404);
   if (reqRow.status !== 'PENDENTE') {
     throw new DomainError('Este pedido de acesso já foi analisado.', 400);
+  }
+
+  const reviewedAt = formatDateTimeNow();
+  if (usingFallbackStore) {
+    const updatedRow: DbRow = {
+      ...reqRow,
+      status: 'RECUSADO',
+      reviewed_by: params.admin.name.slice(0, 120),
+      reviewed_at: reviewedAt,
+      updated_at: new Date().toISOString(),
+    };
+    await writeFallbackAccessRequestsSupabase(
+      fallbackRows.map((r) => (String(r.id) === params.requestId ? updatedRow : r))
+    );
+    return mapAccessRequest(updatedRow);
   }
 
   const updated = await sbRequest<DbRow[]>(
@@ -960,7 +1160,7 @@ export async function rejectAccessRequestSupabase(params: { requestId: string; a
       body: {
         status: 'RECUSADO',
         reviewed_by: params.admin.name.slice(0, 120),
-        reviewed_at: formatDateTimeNow(),
+        reviewed_at: reviewedAt,
         updated_at: new Date().toISOString(),
       },
     }
@@ -1781,6 +1981,10 @@ export async function resetAllDataSupabase(
     method: 'DELETE',
     prefer: 'return=minimal',
     ignoreMissingTable: true,
+  });
+  await sbRequest(`managed_lists?id=eq.${ACCESS_REQUESTS_STORE_ID}`, {
+    method: 'DELETE',
+    prefer: 'return=minimal',
   });
   await sbRequest('collaborators?id=not.is.null', { method: 'DELETE', prefer: 'return=minimal' });
   await sbRequest('products?id=not.is.null', { method: 'DELETE', prefer: 'return=minimal' });

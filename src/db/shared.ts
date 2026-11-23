@@ -38,6 +38,7 @@ export function normalizePermissions(perms?: Partial<UserPermissions> | null): U
     saidas: Boolean(perms?.saidas),
     colaboradores:
       perms?.colaboradores !== undefined ? Boolean(perms.colaboradores) : Boolean(perms?.saidas),
+    destinos: perms?.destinos !== undefined ? Boolean(perms.destinos) : true,
     relatorios: Boolean(perms?.relatorios),
     estatisticas: Boolean(perms?.estatisticas),
     configuracoes: Boolean(perms?.configuracoes),
@@ -50,6 +51,7 @@ export const FULL_ADMIN_PERMISSIONS: UserPermissions = {
   entradas: true,
   saidas: true,
   colaboradores: true,
+  destinos: true,
   relatorios: true,
   estatisticas: true,
   configuracoes: true,

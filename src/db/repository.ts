@@ -86,6 +86,7 @@ import {
   resolveAuthenticatedUserSupabase,
   toggleCollaboratorActiveSupabase,
   updateCollaboratorSupabase,
+  updateDestinationsSupabase,
   updateManagedListsSupabase,
   updateProductSupabase,
   updateSystemSettingsSupabase,
@@ -481,14 +482,14 @@ export async function resolveAuthenticatedUser(params: {
   }
 }
 
-export async function getBootstrapData(currentUser: User, uid: string) {
+export async function getBootstrapData(currentUser: User, uid: string, forceSync = false) {
   if (!isSqlDatabaseConfigured()) {
     return getBootstrapDataSupabase(currentUser, uid);
   }
   try {
     await ensureDefaultsSeeded();
     await ensureInitialSupabaseSync();
-    await pullFromSupabaseToCloudSql();
+    await pullFromSupabaseToCloudSql({ force: forceSync });
 
     const [
       allUsersRows,
@@ -707,6 +708,32 @@ export async function updateManagedListsInDb(params: {
   }
 }
 
+export async function updateDestinationsInDb(destinations: string[]) {
+  if (!isSqlDatabaseConfigured()) {
+    return updateDestinationsSupabase(destinations);
+  }
+  const cleanDestinations = destinations
+    .map((d) => String(d || '').trim().slice(0, 120))
+    .filter(Boolean)
+    .slice(0, 150);
+  try {
+    await ensureDefaultsSeeded();
+    const updatedLists = await db
+      .update(managedLists)
+      .set({
+        destinations: cleanDestinations,
+        updatedAt: new Date(),
+      })
+      .where(eq(managedLists.id, 'global'))
+      .returning();
+
+    await syncManagedListsToSupabase(updatedLists[0]);
+  } catch (error) {
+    console.error('Database query failed in updateDestinationsInDb:', error);
+    throw new Error('Falha ao atualizar clientes e locais de destino.', { cause: error });
+  }
+}
+
 export async function createUserInDb(newUser: Omit<User, 'id' | 'createdAt'>) {
   if (!isSqlDatabaseConfigured()) {
     return createUserSupabase(newUser);
@@ -716,6 +743,15 @@ export async function createUserInDb(newUser: Omit<User, 'id' | 'createdAt'>) {
     throw new DomainError('Nome e e-mail do usuário são obrigatórios.', 400);
   }
   try {
+    const existing = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, emailLower))
+      .limit(1);
+    if (existing[0]) {
+      throw new DomainError('Já existe um usuário cadastrado com este e-mail.', 409);
+    }
+
     const id = `user-${Date.now()}`;
     const today = formatDateToday();
     const inserted = await db
@@ -737,6 +773,11 @@ export async function createUserInDb(newUser: Omit<User, 'id' | 'createdAt'>) {
     await syncUserToSupabase(inserted[0]);
     return mapUserRow(inserted[0]);
   } catch (error) {
+    if (error instanceof DomainError) throw error;
+    const msg = error instanceof Error ? error.message : String(error || '');
+    if (msg.includes('users_email_key') || msg.includes('23505')) {
+      throw new DomainError('Já existe um usuário cadastrado com este e-mail.', 409);
+    }
     console.error('Database query failed in createUserInDb:', error);
     throw new Error('Falha ao cadastrar usuário no banco de dados.', { cause: error });
   }
@@ -748,6 +789,15 @@ export async function updateUserInDb(updatedUser: User) {
   }
   const emailLower = updatedUser.email.trim().toLowerCase();
   try {
+    const duplicate = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, emailLower))
+      .limit(1);
+    if (duplicate[0] && duplicate[0].id !== updatedUser.id) {
+      throw new DomainError('Já existe outro usuário cadastrado com este e-mail.', 409);
+    }
+
     const updated = await db
       .update(users)
       .set({
@@ -771,6 +821,10 @@ export async function updateUserInDb(updatedUser: User) {
     return mapUserRow(updated[0]);
   } catch (error) {
     if (error instanceof DomainError) throw error;
+    const msg = error instanceof Error ? error.message : String(error || '');
+    if (msg.includes('users_email_key') || msg.includes('23505')) {
+      throw new DomainError('Já existe outro usuário cadastrado com este e-mail.', 409);
+    }
     console.error('Database query failed in updateUserInDb:', error);
     throw new Error('Falha ao atualizar usuário no banco de dados.', { cause: error });
   }
@@ -826,8 +880,13 @@ export async function deleteUserInDb(userId: string) {
     throw new DomainError('Não é permitido excluir o Administrador principal.', 400);
   }
   try {
+    const existing = await db
+      .select({ email: users.email })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
     await db.delete(users).where(eq(users.id, userId));
-    await deleteUserFromSupabase(userId);
+    await deleteUserFromSupabase(userId, existing[0]?.email);
   } catch (error) {
     console.error('Database query failed in deleteUserInDb:', error);
     throw new Error('Falha ao excluir usuário.', { cause: error });
@@ -879,7 +938,7 @@ export async function createAccessRequestInDb(params: {
       return {
         alreadyAuthorized: true,
         message:
-          'Este e-mail já está autorizado! Use a aba "Primeiro Acesso" para criar sua senha ou clique em "Continuar com conta Google".',
+          'Este e-mail já está autorizado! Use a aba "1º Acesso" para criar sua senha ou clique em "Continuar com conta Google".',
       };
     }
 
@@ -976,6 +1035,7 @@ export async function approveAccessRequestInDb(params: {
           entradas: false,
           saidas: true,
           colaboradores: true,
+          destinos: true,
           relatorios: false,
           estatisticas: false,
           configuracoes: false,

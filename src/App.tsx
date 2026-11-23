@@ -10,6 +10,7 @@ import { ProductsTab } from './components/tabs/ProductsTab';
 import { EntriesTab } from './components/tabs/EntriesTab';
 import { ExitsTab } from './components/tabs/ExitsTab';
 import { CollaboratorsTab } from './components/tabs/CollaboratorsTab';
+import { DestinationsTab } from './components/tabs/DestinationsTab';
 import { ReportsTab } from './components/tabs/ReportsTab';
 import { StatisticsTab } from './components/tabs/StatisticsTab';
 import { SettingsTab } from './components/tabs/SettingsTab';
@@ -21,6 +22,7 @@ const VALID_TABS: TabId[] = [
   'entradas',
   'saidas',
   'colaboradores',
+  'destinos',
   'relatorios',
   'estatisticas',
   'configuracoes',
@@ -110,6 +112,8 @@ const MainLayout: React.FC = () => {
         return <ExitsTab />;
       case 'colaboradores':
         return <CollaboratorsTab />;
+      case 'destinos':
+        return <DestinationsTab />;
       case 'relatorios':
         return <ReportsTab />;
       case 'estatisticas':

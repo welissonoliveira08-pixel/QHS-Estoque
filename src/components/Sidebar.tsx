@@ -12,6 +12,7 @@ import {
   ShieldAlert,
   UserCheck,
   Users,
+  MapPin,
   X,
 } from 'lucide-react';
 
@@ -52,6 +53,12 @@ const ALL_NAV_ITEMS: NavItem[] = [
     label: 'Colaboradores',
     description: 'Funcionários de obra e retiradas',
     icon: Users,
+  },
+  {
+    id: 'destinos',
+    label: 'Clientes e Destinos',
+    description: 'Clientes e locais de destino',
+    icon: MapPin,
   },
   {
     id: 'relatorios',

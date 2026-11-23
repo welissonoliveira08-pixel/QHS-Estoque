@@ -110,6 +110,7 @@ function normalizePermissions(perms) {
     entradas: Boolean(perms?.entradas),
     saidas: Boolean(perms?.saidas),
     colaboradores: perms?.colaboradores !== void 0 ? Boolean(perms.colaboradores) : Boolean(perms?.saidas),
+    destinos: perms?.destinos !== void 0 ? Boolean(perms.destinos) : true,
     relatorios: Boolean(perms?.relatorios),
     estatisticas: Boolean(perms?.estatisticas),
     configuracoes: Boolean(perms?.configuracoes)
@@ -121,6 +122,7 @@ var FULL_ADMIN_PERMISSIONS = {
   entradas: true,
   saidas: true,
   colaboradores: true,
+  destinos: true,
   relatorios: true,
   estatisticas: true,
   configuracoes: true
@@ -540,6 +542,35 @@ async function resolveAuthenticatedUserSupabase(params) {
     user: mapUser(userRow)
   };
 }
+var ACCESS_REQUESTS_STORE_ID = "access_requests_store";
+function isMissingTableDomainError(err) {
+  if (err instanceof DomainError && err.statusCode === 503 && err.message.includes("Tabela n\xE3o encontrada")) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : String(err || "");
+  return msg.includes("PGRST205") || msg.includes("42P01") || msg.includes("Tabela n\xE3o encontrada");
+}
+async function readFallbackAccessRequestsSupabase() {
+  const rows = await sbRequest(
+    `managed_lists?id=eq.${ACCESS_REQUESTS_STORE_ID}&limit=1`
+  );
+  const store = rows[0];
+  if (!store || !Array.isArray(store.groups)) return [];
+  return store.groups;
+}
+async function writeFallbackAccessRequestsSupabase(rows) {
+  await sbRequest("managed_lists?on_conflict=id", {
+    method: "POST",
+    prefer: "resolution=merge-duplicates,return=minimal",
+    body: {
+      id: ACCESS_REQUESTS_STORE_ID,
+      groups: rows,
+      roles: [],
+      destinations: [],
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }
+  });
+}
 async function getBootstrapDataSupabase(currentUser, uid) {
   await ensureDefaultsSeededSupabase();
   const [
@@ -564,7 +595,7 @@ async function getBootstrapDataSupabase(currentUser, uid) {
     ),
     currentUser.isAdmin ? sbRequest("deletion_logs?select=*") : Promise.resolve([]),
     currentUser.isAdmin ? sbRequest("access_requests?select=*", { ignoreMissingTable: true }) : Promise.resolve([]),
-    sbRequest("managed_lists?id=eq.global&limit=1"),
+    sbRequest(`managed_lists?id=in.(global,${ACCESS_REQUESTS_STORE_ID})`),
     sbRequest("system_settings?id=eq.global&limit=1")
   ]);
   const mappedUsers = allUsersRows.map(mapUser);
@@ -577,7 +608,10 @@ async function getBootstrapDataSupabase(currentUser, uid) {
       canDelete: false
     }))
   ];
-  const listsRow = listsRows[0];
+  const listsRow = listsRows.find((r) => r.id === "global");
+  const fallbackStoreRow = listsRows.find((r) => r.id === ACCESS_REQUESTS_STORE_ID);
+  const fallbackAccessReqRows = currentUser.isAdmin && accessReqRows.length === 0 && fallbackStoreRow && Array.isArray(fallbackStoreRow.groups) ? fallbackStoreRow.groups : [];
+  const effectiveAccessReqRows = accessReqRows.length > 0 ? accessReqRows : fallbackAccessReqRows;
   const lists = listsRow ? {
     groups: Array.isArray(listsRow.groups) ? listsRow.groups : INITIAL_LISTS.groups,
     roles: Array.isArray(listsRow.roles) ? listsRow.roles : INITIAL_LISTS.roles,
@@ -601,7 +635,7 @@ async function getBootstrapDataSupabase(currentUser, uid) {
     negativeRequests: negRows.map(mapNegativeRequest).sort((a, b) => b.date.localeCompare(a.date)),
     deletionRequests: delReqRows.map(mapDeletionRequest).sort((a, b) => b.date.localeCompare(a.date)),
     deletionLogs: delLogRows.map(mapDeletionLog).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt)),
-    accessRequests: accessReqRows.map(mapAccessRequest).sort((a, b) => b.date.localeCompare(a.date)),
+    accessRequests: effectiveAccessReqRows.map(mapAccessRequest).sort((a, b) => b.date.localeCompare(a.date)),
     managedLists: lists,
     settings
   };
@@ -668,10 +702,27 @@ async function updateManagedListsSupabase(params) {
     });
   }
 }
+async function updateDestinationsSupabase(destinations) {
+  await ensureDefaultsSeededSupabase();
+  await sbRequest("managed_lists?id=eq.global", {
+    method: "PATCH",
+    prefer: "return=minimal",
+    body: {
+      destinations: destinations.map((d) => String(d || "").trim().slice(0, 120)).filter(Boolean).slice(0, 150),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }
+  });
+}
 async function createUserSupabase(newUser) {
   const emailLower = newUser.email.trim().toLowerCase();
   if (!emailLower || !newUser.name.trim()) {
     throw new DomainError("Nome e e-mail do usu\xE1rio s\xE3o obrigat\xF3rios.", 400);
+  }
+  const existing = await sbRequest(
+    `users?email=eq.${encodeURIComponent(emailLower)}&select=id&limit=1`
+  );
+  if (existing[0]) {
+    throw new DomainError("J\xE1 existe um usu\xE1rio cadastrado com este e-mail.", 409);
   }
   const inserted = await sbRequest("users", {
     method: "POST",
@@ -694,6 +745,12 @@ async function createUserSupabase(newUser) {
 }
 async function updateUserSupabase(updatedUser) {
   const emailLower = updatedUser.email.trim().toLowerCase();
+  const duplicate = await sbRequest(
+    `users?email=eq.${encodeURIComponent(emailLower)}&select=id&limit=1`
+  );
+  if (duplicate[0] && String(duplicate[0].id) !== updatedUser.id) {
+    throw new DomainError("J\xE1 existe outro usu\xE1rio cadastrado com este e-mail.", 409);
+  }
   const updated = await sbRequest(
     `users?id=eq.${encodeURIComponent(updatedUser.id)}`,
     {
@@ -770,38 +827,80 @@ async function createAccessRequestSupabase(params) {
   if (existingUsers[0] && existingUsers[0].active !== false) {
     return {
       alreadyAuthorized: true,
-      message: 'Este e-mail j\xE1 est\xE1 autorizado! Use a aba "Primeiro Acesso" para criar sua senha ou clique em "Continuar com conta Google".'
+      message: 'Este e-mail j\xE1 est\xE1 autorizado! Use a aba "1\xBA Acesso" para criar sua senha ou clique em "Continuar com conta Google".'
     };
   }
-  const existingPending = await sbRequest(
-    `access_requests?email=eq.${encodeURIComponent(emailLower)}&status=eq.PENDENTE&limit=1`
-  );
   const nowFormatted = formatDateTimeNow();
-  if (existingPending[0]) {
-    const updated = await sbRequest(
-      `access_requests?id=eq.${encodeURIComponent(String(existingPending[0].id))}`,
-      {
-        method: "PATCH",
-        prefer: "return=representation",
-        body: {
-          name: cleanName.slice(0, 120),
-          role: (params.role || "").trim().slice(0, 100),
-          department: (params.department || "").trim().slice(0, 100),
-          reason: (params.reason || "").trim().slice(0, 500),
-          date: nowFormatted,
-          updated_at: (/* @__PURE__ */ new Date()).toISOString()
-        }
-      }
+  try {
+    const existingPending = await sbRequest(
+      `access_requests?email=eq.${encodeURIComponent(emailLower)}&status=eq.PENDENTE&limit=1`
     );
+    if (existingPending[0]) {
+      const updated = await sbRequest(
+        `access_requests?id=eq.${encodeURIComponent(String(existingPending[0].id))}`,
+        {
+          method: "PATCH",
+          prefer: "return=representation",
+          body: {
+            name: cleanName.slice(0, 120),
+            role: (params.role || "").trim().slice(0, 100),
+            department: (params.department || "").trim().slice(0, 100),
+            reason: (params.reason || "").trim().slice(0, 500),
+            date: nowFormatted,
+            updated_at: (/* @__PURE__ */ new Date()).toISOString()
+          }
+        }
+      );
+      return {
+        request: mapAccessRequest(updated[0]),
+        message: "Seu pedido de acesso foi atualizado e reenviado ao Administrador da QHS Engenharia! Assim que aprovado, voc\xEA poder\xE1 entrar no aplicativo."
+      };
+    }
+    const inserted = await sbRequest("access_requests", {
+      method: "POST",
+      prefer: "return=representation",
+      body: {
+        id: `acc-req-${Date.now()}`,
+        org_id: ORG_ID,
+        name: cleanName.slice(0, 120),
+        email: emailLower.slice(0, 200),
+        role: (params.role || "").trim().slice(0, 100),
+        department: (params.department || "").trim().slice(0, 100),
+        reason: (params.reason || "").trim().slice(0, 500),
+        date: nowFormatted,
+        status: "PENDENTE",
+        updated_at: (/* @__PURE__ */ new Date()).toISOString()
+      }
+    });
     return {
-      request: mapAccessRequest(updated[0]),
-      message: "Seu pedido de acesso foi atualizado e reenviado ao Administrador da QHS Engenharia! Assim que aprovado, voc\xEA poder\xE1 entrar no aplicativo."
+      request: mapAccessRequest(inserted[0]),
+      message: "Pedido enviado com sucesso ao Administrador! Aguarde a aprova\xE7\xE3o e tente entrar novamente."
     };
-  }
-  const inserted = await sbRequest("access_requests", {
-    method: "POST",
-    prefer: "return=representation",
-    body: {
+  } catch (err) {
+    if (!isMissingTableDomainError(err)) throw err;
+    const storeRows = await readFallbackAccessRequestsSupabase();
+    const existingIdx = storeRows.findIndex(
+      (r) => String(r.email || "").trim().toLowerCase() === emailLower && String(r.status || "") === "PENDENTE"
+    );
+    if (existingIdx >= 0) {
+      const updatedRow = {
+        ...storeRows[existingIdx],
+        name: cleanName.slice(0, 120),
+        role: (params.role || "").trim().slice(0, 100),
+        department: (params.department || "").trim().slice(0, 100),
+        reason: (params.reason || "").trim().slice(0, 500),
+        date: nowFormatted,
+        updated_at: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      const nextStore = [...storeRows];
+      nextStore[existingIdx] = updatedRow;
+      await writeFallbackAccessRequestsSupabase(nextStore);
+      return {
+        request: mapAccessRequest(updatedRow),
+        message: "Seu pedido de acesso foi atualizado e reenviado ao Administrador da QHS Engenharia! Assim que aprovado, voc\xEA poder\xE1 entrar no aplicativo."
+      };
+    }
+    const newRow = {
       id: `acc-req-${Date.now()}`,
       org_id: ORG_ID,
       name: cleanName.slice(0, 120),
@@ -811,19 +910,39 @@ async function createAccessRequestSupabase(params) {
       reason: (params.reason || "").trim().slice(0, 500),
       date: nowFormatted,
       status: "PENDENTE",
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
       updated_at: (/* @__PURE__ */ new Date()).toISOString()
-    }
-  });
-  return {
-    request: mapAccessRequest(inserted[0]),
-    message: "Pedido enviado com sucesso ao Administrador! Aguarde a aprova\xE7\xE3o e tente entrar novamente."
-  };
+    };
+    await writeFallbackAccessRequestsSupabase([newRow, ...storeRows]);
+    return {
+      request: mapAccessRequest(newRow),
+      message: "Pedido enviado com sucesso ao Administrador! Aguarde a aprova\xE7\xE3o e tente entrar novamente."
+    };
+  }
 }
 async function approveAccessRequestSupabase(params) {
-  const reqRows = await sbRequest(
-    `access_requests?id=eq.${encodeURIComponent(params.requestId)}&limit=1`
-  );
-  const reqRow = reqRows[0];
+  let reqRow;
+  let usingFallbackStore = false;
+  let fallbackRows = [];
+  try {
+    const reqRows = await sbRequest(
+      `access_requests?id=eq.${encodeURIComponent(params.requestId)}&limit=1`
+    );
+    reqRow = reqRows[0];
+  } catch (err) {
+    if (!isMissingTableDomainError(err)) throw err;
+    usingFallbackStore = true;
+    fallbackRows = await readFallbackAccessRequestsSupabase();
+    reqRow = fallbackRows.find((r) => String(r.id) === params.requestId);
+  }
+  if (!reqRow && !usingFallbackStore) {
+    fallbackRows = await readFallbackAccessRequestsSupabase();
+    const fallbackMatch = fallbackRows.find((r) => String(r.id) === params.requestId);
+    if (fallbackMatch) {
+      usingFallbackStore = true;
+      reqRow = fallbackMatch;
+    }
+  }
   if (!reqRow) throw new DomainError("Pedido de acesso n\xE3o encontrado.", 404);
   if (reqRow.status !== "PENDENTE") {
     throw new DomainError("Este pedido de acesso j\xE1 foi analisado.", 400);
@@ -836,6 +955,7 @@ async function approveAccessRequestSupabase(params) {
       entradas: false,
       saidas: true,
       colaboradores: true,
+      destinos: true,
       relatorios: false,
       estatisticas: false,
       configuracoes: false
@@ -885,6 +1005,23 @@ async function approveAccessRequestSupabase(params) {
     });
     savedUserRow = insertedUsers[0];
   }
+  const reviewedAt = formatDateTimeNow();
+  if (usingFallbackStore) {
+    const updatedReqRow = {
+      ...reqRow,
+      status: "APROVADO",
+      reviewed_by: params.admin.name.slice(0, 120),
+      reviewed_at: reviewedAt,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    await writeFallbackAccessRequestsSupabase(
+      fallbackRows.map((r) => String(r.id) === params.requestId ? updatedReqRow : r)
+    );
+    return {
+      user: mapUser(savedUserRow),
+      request: mapAccessRequest(updatedReqRow)
+    };
+  }
   const updatedReqs = await sbRequest(
     `access_requests?id=eq.${encodeURIComponent(params.requestId)}`,
     {
@@ -893,7 +1030,7 @@ async function approveAccessRequestSupabase(params) {
       body: {
         status: "APROVADO",
         reviewed_by: params.admin.name.slice(0, 120),
-        reviewed_at: formatDateTimeNow(),
+        reviewed_at: reviewedAt,
         updated_at: (/* @__PURE__ */ new Date()).toISOString()
       }
     }
@@ -904,13 +1041,45 @@ async function approveAccessRequestSupabase(params) {
   };
 }
 async function rejectAccessRequestSupabase(params) {
-  const reqRows = await sbRequest(
-    `access_requests?id=eq.${encodeURIComponent(params.requestId)}&limit=1`
-  );
-  const reqRow = reqRows[0];
+  let reqRow;
+  let usingFallbackStore = false;
+  let fallbackRows = [];
+  try {
+    const reqRows = await sbRequest(
+      `access_requests?id=eq.${encodeURIComponent(params.requestId)}&limit=1`
+    );
+    reqRow = reqRows[0];
+  } catch (err) {
+    if (!isMissingTableDomainError(err)) throw err;
+    usingFallbackStore = true;
+    fallbackRows = await readFallbackAccessRequestsSupabase();
+    reqRow = fallbackRows.find((r) => String(r.id) === params.requestId);
+  }
+  if (!reqRow && !usingFallbackStore) {
+    fallbackRows = await readFallbackAccessRequestsSupabase();
+    const fallbackMatch = fallbackRows.find((r) => String(r.id) === params.requestId);
+    if (fallbackMatch) {
+      usingFallbackStore = true;
+      reqRow = fallbackMatch;
+    }
+  }
   if (!reqRow) throw new DomainError("Pedido de acesso n\xE3o encontrado.", 404);
   if (reqRow.status !== "PENDENTE") {
     throw new DomainError("Este pedido de acesso j\xE1 foi analisado.", 400);
+  }
+  const reviewedAt = formatDateTimeNow();
+  if (usingFallbackStore) {
+    const updatedRow = {
+      ...reqRow,
+      status: "RECUSADO",
+      reviewed_by: params.admin.name.slice(0, 120),
+      reviewed_at: reviewedAt,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    await writeFallbackAccessRequestsSupabase(
+      fallbackRows.map((r) => String(r.id) === params.requestId ? updatedRow : r)
+    );
+    return mapAccessRequest(updatedRow);
   }
   const updated = await sbRequest(
     `access_requests?id=eq.${encodeURIComponent(params.requestId)}`,
@@ -920,7 +1089,7 @@ async function rejectAccessRequestSupabase(params) {
       body: {
         status: "RECUSADO",
         reviewed_by: params.admin.name.slice(0, 120),
-        reviewed_at: formatDateTimeNow(),
+        reviewed_at: reviewedAt,
         updated_at: (/* @__PURE__ */ new Date()).toISOString()
       }
     }
@@ -1583,6 +1752,10 @@ async function resetAllDataSupabase(adminUid, adminEmail, adminName) {
     prefer: "return=minimal",
     ignoreMissingTable: true
   });
+  await sbRequest(`managed_lists?id=eq.${ACCESS_REQUESTS_STORE_ID}`, {
+    method: "DELETE",
+    prefer: "return=minimal"
+  });
   await sbRequest("collaborators?id=not.is.null", { method: "DELETE", prefer: "return=minimal" });
   await sbRequest("products?id=not.is.null", { method: "DELETE", prefer: "return=minimal" });
   await sbRequest("users?id=neq.user-owner", { method: "DELETE", prefer: "return=minimal" });
@@ -1807,6 +1980,21 @@ async function handler(req, res) {
         renameGroup: body.renameGroup,
         renameRole: body.renameRole
       });
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (method === "PUT" && pathname === "/api/destinations") {
+      if (!session.dbUser.isAdmin && session.dbUser.permissions?.destinos === false) {
+        throw new DomainError(
+          "Voc\xEA n\xE3o possui permiss\xE3o para alterar clientes e locais de destino.",
+          403
+        );
+      }
+      const body = await readJsonBody(req);
+      if (!Array.isArray(body.destinations)) {
+        throw new DomainError("Lista de clientes e locais de destino inv\xE1lida.", 400);
+      }
+      await updateDestinationsSupabase(body.destinations.map((d) => String(d ?? "")));
       sendJson(res, 200, { ok: true });
       return;
     }

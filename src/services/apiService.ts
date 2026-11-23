@@ -134,8 +134,10 @@ export async function requestAccessApi(params: {
   };
 }
 
-export function fetchBootstrapData(): Promise<BootstrapResponse> {
-  return apiFetch<BootstrapResponse>('/api/bootstrap', { method: 'GET' });
+export function fetchBootstrapData(forceSync = false): Promise<BootstrapResponse> {
+  return apiFetch<BootstrapResponse>(forceSync ? '/api/bootstrap?force=1' : '/api/bootstrap', {
+    method: 'GET',
+  });
 }
 
 export function patchShowProductPhotosApi(showProductPhotos: boolean): Promise<{ ok: boolean }> {
@@ -160,6 +162,13 @@ export function updateManagedListsApi(params: {
   return apiFetch('/api/lists', {
     method: 'PUT',
     body: JSON.stringify(params),
+  });
+}
+
+export function updateDestinationsApi(destinations: string[]): Promise<{ ok: boolean }> {
+  return apiFetch('/api/destinations', {
+    method: 'PUT',
+    body: JSON.stringify({ destinations }),
   });
 }
 

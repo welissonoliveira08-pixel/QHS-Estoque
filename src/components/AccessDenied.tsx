@@ -13,6 +13,7 @@ const TAB_LABELS: Record<TabId, string> = {
   entradas: 'Entradas no Estoque',
   saidas: 'Saídas e Requisições',
   colaboradores: 'Colaboradores',
+  destinos: 'Clientes e Locais de Destino',
   relatorios: 'Relatórios do Almoxarifado',
   estatisticas: 'Estatísticas de Inventário',
   configuracoes: 'Configurações e Permissões',
@@ -49,7 +50,7 @@ export const AccessDenied: React.FC<AccessDeniedProps> = ({ requestedTab }) => {
         </h2>
 
         <p className="text-xs sm:text-sm text-zinc-600 leading-relaxed mb-6">
-          O usuário <strong className="text-zinc-900 font-semibold">{currentUser.name}</strong> ({currentUser.department}) 
+          O usuário <strong className="text-zinc-900 font-semibold">{currentUser.name}</strong>{' '}
           não possui autorização para acessar esta aba. O administrador do sistema gerencia individualmente 
           as permissões de visualização e operação de cada colaborador.
         </p>

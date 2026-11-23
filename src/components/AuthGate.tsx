@@ -44,10 +44,8 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
 
   // Access request form fields (for both login 'request_access' mode & 'unauthorized' screen)
   const [reqName, setReqName] = useState('');
-  const [reqRole, setReqRole] = useState('');
-  const [reqDepartment, setReqDepartment] = useState('');
-  const [reqReason, setReqReason] = useState('');
   const [reqSentMessage, setReqSentMessage] = useState<string | null>(null);
+  const [alreadyAuthorizedPrompt, setAlreadyAuthorizedPrompt] = useState(false);
 
   const [submitting, setSubmitting] = useState(false);
   const [retrying, setRetrying] = useState(false);
@@ -293,9 +291,6 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
       const res = await submitAccessRequest({
         name: reqName,
         email: firebaseUser.email,
-        role: reqRole,
-        department: reqDepartment,
-        reason: reqReason,
       });
       setSubmitting(false);
       if (res.success) {
@@ -386,47 +381,7 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                     value={reqName}
                     onChange={(e) => setReqName(e.target.value)}
                     placeholder="Ex: João Silva"
-                    className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
-                  />
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                  <div>
-                    <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
-                      Cargo / Função
-                    </label>
-                    <input
-                      type="text"
-                      value={reqRole}
-                      onChange={(e) => setReqRole(e.target.value)}
-                      placeholder="Ex: Almoxarife"
-                      className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
-                      Obra / Setor
-                    </label>
-                    <input
-                      type="text"
-                      value={reqDepartment}
-                      onChange={(e) => setReqDepartment(e.target.value)}
-                      placeholder="Ex: Obra Centro"
-                      className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-semibold text-zinc-700 mb-1">
-                    Observação (opcional)
-                  </label>
-                  <input
-                    type="text"
-                    value={reqReason}
-                    onChange={(e) => setReqReason(e.target.value)}
-                    placeholder="Motivo ou solicitação para o Administrador"
-                    className="w-full px-3 py-2 text-xs border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
+                    className="w-full px-3 py-2.5 text-xs border border-zinc-300 rounded-lg bg-white focus:outline-none focus:border-red-600"
                   />
                 </div>
 
@@ -479,16 +434,18 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
     setMode(nextMode);
     setLocalError(null);
     setLocalSuccess(null);
+    setAlreadyAuthorizedPrompt(false);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLocalError(null);
     setLocalSuccess(null);
+    setAlreadyAuthorizedPrompt(false);
 
     if (mode === 'login') {
       setSubmitting(true);
-      const res = await signInWithEmail(email, password);
+      const res = await signInWithEmail(email.trim(), password);
       setSubmitting(false);
       if (!res.success && res.message) {
         setLocalError(res.message);
@@ -506,7 +463,7 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
         return;
       }
       setSubmitting(true);
-      const res = await registerFirstAccessWithEmail(email, password);
+      const res = await registerFirstAccessWithEmail(email.trim(), password);
       setSubmitting(false);
       if (!res.success && res.message) {
         setLocalError(res.message);
@@ -519,18 +476,13 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
     if (mode === 'request_access') {
       setSubmitting(true);
       const res = await submitAccessRequest({
-        name: reqName,
-        email,
-        role: reqRole,
-        department: reqDepartment,
-        reason: reqReason,
+        name: reqName.trim(),
+        email: email.trim(),
       });
       setSubmitting(false);
       if (res.success) {
         setLocalSuccess(res.message);
-        if (!res.alreadyAuthorized) {
-          setReqReason('');
-        }
+        setAlreadyAuthorizedPrompt(Boolean(res.alreadyAuthorized));
       } else {
         setLocalError(res.message);
       }
@@ -659,12 +611,19 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                 <div className="flex flex-wrap gap-2 pl-6 pt-1">
                   <button
                     type="button"
+                    onClick={() => switchMode('first_access')}
+                    className="px-2.5 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-md text-[11px] font-bold transition-colors cursor-pointer"
+                  >
+                    Ir para 1º Acesso
+                  </button>
+                  <button
+                    type="button"
                     disabled={submitting}
                     onClick={async () => {
                       setLocalError(null);
                       setLocalSuccess(null);
                       setSubmitting(true);
-                      const res = await sendPasswordReset(email);
+                      const res = await sendPasswordReset(email.trim());
                       setSubmitting(false);
                       if (res.success && res.message) {
                         setLocalSuccess(res.message);
@@ -672,7 +631,7 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                         setLocalError(res.message);
                       }
                     }}
-                    className="px-2.5 py-1 bg-white border border-red-300 hover:bg-red-100 text-red-800 rounded-md text-[11px] font-bold transition-colors cursor-pointer"
+                    className="px-2.5 py-1.5 bg-white border border-red-300 hover:bg-red-100 text-red-800 rounded-md text-[11px] font-bold transition-colors cursor-pointer"
                   >
                     Definir senha por e-mail
                   </button>
@@ -682,7 +641,7 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                       setLocalError(null);
                       void signInWithGoogle();
                     }}
-                    className="px-2.5 py-1 bg-zinc-900 hover:bg-zinc-800 text-white rounded-md text-[11px] font-bold transition-colors cursor-pointer"
+                    className="px-2.5 py-1.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-md text-[11px] font-bold transition-colors cursor-pointer"
                   >
                     Entrar com Google agora
                   </button>
@@ -692,9 +651,22 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
           )}
 
           {localSuccess && (
-            <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg flex items-start gap-2 text-xs text-emerald-800">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-              <span>{localSuccess}</span>
+            <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg space-y-2 text-xs text-emerald-800">
+              <div className="flex items-start gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <span>{localSuccess}</span>
+              </div>
+              {alreadyAuthorizedPrompt && (
+                <div className="pl-6">
+                  <button
+                    type="button"
+                    onClick={() => switchMode('first_access')}
+                    className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-md text-[11px] font-bold transition-colors cursor-pointer"
+                  >
+                    Ir para 1º Acesso e criar minha senha
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -724,6 +696,10 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                 <Mail className="w-4 h-4 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
                   type="email"
+                  inputMode="email"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
                   required
                   autoComplete="email"
                   value={email}
@@ -733,50 +709,6 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                 />
               </div>
             </div>
-
-            {mode === 'request_access' && (
-              <>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                  <div>
-                    <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                      Cargo / Função
-                    </label>
-                    <input
-                      type="text"
-                      value={reqRole}
-                      onChange={(e) => setReqRole(e.target.value)}
-                      placeholder="Ex: Almoxarife"
-                      className="w-full px-3 py-2.5 text-xs border border-zinc-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                      Obra / Departamento
-                    </label>
-                    <input
-                      type="text"
-                      value={reqDepartment}
-                      onChange={(e) => setReqDepartment(e.target.value)}
-                      placeholder="Ex: Obra Norte"
-                      className="w-full px-3 py-2.5 text-xs border border-zinc-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                    Observação para o Administrador
-                  </label>
-                  <input
-                    type="text"
-                    value={reqReason}
-                    onChange={(e) => setReqReason(e.target.value)}
-                    placeholder="Ex: Preciso lançar entradas e saídas da obra"
-                    className="w-full px-3 py-2.5 text-xs border border-zinc-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600"
-                  />
-                </div>
-              </>
-            )}
 
             {(mode === 'login' || mode === 'first_access') && (
               <div>
@@ -905,10 +837,6 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
             </svg>
             <span>Continuar com conta Google</span>
           </button>
-
-          <div className="pt-3 border-t border-zinc-100 text-[11px] text-zinc-500 text-center">
-            Dados sincronizados em nuvem · QHS Engenharia
-          </div>
         </div>
       </div>
     </div>

@@ -470,18 +470,186 @@ async function deleteSupabaseRow(table: string, id: string): Promise<boolean> {
   return deleteSupabaseWhere(table, `id=eq.${encodeURIComponent(id)}`);
 }
 
+async function upsertSupabaseUsers(rows: UserRow[]): Promise<boolean> {
+  if (rows.length === 0) return true;
+  const config = ensureWritableConfig();
+  if (!config) return false;
+
+  const remoteRes = await fetchSupabaseTable(config, 'users');
+  const remoteById = new Map<string, Record<string, unknown>>();
+  const remoteByEmail = new Map<string, Record<string, unknown>>();
+  const remoteByUid = new Map<string, Record<string, unknown>>();
+
+  for (const r of remoteRes.rows) {
+    if (typeof r.id !== 'string') continue;
+    remoteById.set(r.id, r);
+    if (typeof r.email === 'string' && r.email.trim()) {
+      remoteByEmail.set(r.email.trim().toLowerCase(), r);
+    }
+    if (typeof r.uid === 'string' && r.uid.trim()) {
+      remoteByUid.set(r.uid.trim(), r);
+    }
+  }
+
+  for (const row of rows) {
+    const emailLower = row.email.trim().toLowerCase();
+    if (!emailLower) continue;
+
+    const payload = toSupabaseUser(row);
+    const byId = remoteById.get(row.id);
+    const byEmail = remoteByEmail.get(emailLower);
+
+    // Prefer matching by email if another row ID already owns this email on Supabase
+    const targetRemote =
+      byId && (!byEmail || String(byEmail.id) === String(byId.id))
+        ? byId
+        : byEmail ?? byId;
+
+    const targetId = targetRemote && typeof targetRemote.id === 'string' ? targetRemote.id : row.id;
+
+    // Resolve safe UID so we never violate users_uid_key against another user row
+    const desiredUid = typeof payload.uid === 'string' && payload.uid.trim() ? payload.uid.trim() : null;
+    const uidOwner = desiredUid ? remoteByUid.get(desiredUid) : undefined;
+    const safeUid =
+      desiredUid && (!uidOwner || String(uidOwner.id) === targetId)
+        ? desiredUid
+        : targetRemote && typeof targetRemote.uid === 'string'
+        ? targetRemote.uid
+        : null;
+
+    if (targetRemote) {
+      if (targetId !== row.id && toMillis(targetRemote.updated_at) > toMillis(row.updatedAt)) {
+        // Remote row for this email is newer; next pull will reconcile local Cloud SQL
+        continue;
+      }
+
+      const patchBody = {
+        uid: safeUid,
+        name: payload.name,
+        email: emailLower,
+        role: payload.role,
+        department: payload.department,
+        is_admin: payload.is_admin,
+        can_delete: payload.can_delete,
+        active: payload.active,
+        permissions: payload.permissions,
+        registration_date: payload.registration_date,
+        updated_at: payload.updated_at,
+      };
+
+      try {
+        const res = await fetch(`${config.url}/rest/v1/users?id=eq.${encodeURIComponent(targetId)}`, {
+          method: 'PATCH',
+          headers: buildHeaders(config.key, { Prefer: 'return=minimal' }),
+          body: JSON.stringify(patchBody),
+          signal: AbortSignal.timeout(8000),
+        });
+
+        if (!res.ok) {
+          const errorText = await res.text().catch(() => '');
+          handleHttpFailure(config, 'Upsert', 'users', res.status, errorText);
+          return false;
+        }
+
+        const mergedRemote = { ...targetRemote, ...patchBody, id: targetId };
+        remoteById.set(targetId, mergedRemote);
+        remoteByEmail.set(emailLower, mergedRemote);
+        if (safeUid) remoteByUid.set(safeUid, mergedRemote);
+      } catch (error) {
+        handleNetworkFailure(config, 'users', error);
+        return false;
+      }
+      continue;
+    }
+
+    const insertPayload = {
+      ...payload,
+      email: emailLower,
+      uid: safeUid,
+    };
+
+    try {
+      const res = await fetch(`${config.url}/rest/v1/users?on_conflict=id`, {
+        method: 'POST',
+        headers: buildHeaders(config.key, {
+          Prefer: 'resolution=merge-duplicates,return=minimal',
+        }),
+        body: JSON.stringify([insertPayload]),
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (res.status === 409) {
+        // Concurrent insert race on email or uid: re-fetch by email and PATCH in place
+        const existingRes = await fetch(
+          `${config.url}/rest/v1/users?email=eq.${encodeURIComponent(emailLower)}&limit=1`,
+          {
+            method: 'GET',
+            headers: buildHeaders(config.key),
+            signal: AbortSignal.timeout(5000),
+          }
+        );
+        const existingRows = existingRes.ok
+          ? ((await existingRes.json().catch(() => [])) as Array<Record<string, unknown>>)
+          : [];
+        if (existingRows[0] && typeof existingRows[0].id === 'string') {
+          const existingId = existingRows[0].id;
+          const { id: _omitId, ...patchFields } = insertPayload;
+          const patchRes = await fetch(
+            `${config.url}/rest/v1/users?id=eq.${encodeURIComponent(existingId)}`,
+            {
+              method: 'PATCH',
+              headers: buildHeaders(config.key, { Prefer: 'return=minimal' }),
+              body: JSON.stringify(patchFields),
+              signal: AbortSignal.timeout(8000),
+            }
+          );
+          if (patchRes.ok) {
+            const merged = { ...existingRows[0], ...patchFields, id: existingId };
+            remoteById.set(existingId, merged);
+            remoteByEmail.set(emailLower, merged);
+            if (safeUid) remoteByUid.set(safeUid, merged);
+            continue;
+          }
+        }
+      }
+
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => '');
+        handleHttpFailure(config, 'Upsert', 'users', res.status, errorText);
+        return false;
+      }
+
+      remoteById.set(row.id, insertPayload);
+      remoteByEmail.set(emailLower, insertPayload);
+      if (safeUid) remoteByUid.set(safeUid, insertPayload);
+    } catch (error) {
+      handleNetworkFailure(config, 'users', error);
+      return false;
+    }
+  }
+
+  return true;
+}
+
 export async function syncUserToSupabase(row: UserRow | undefined): Promise<void> {
   if (!row) return;
-  await upsertSupabaseRows('users', [toSupabaseUser(row)]);
+  await upsertSupabaseUsers([row]);
 }
 
 export async function syncUsersToSupabase(rows: UserRow[]): Promise<void> {
   if (rows.length === 0) return;
-  await upsertSupabaseRows('users', rows.map(toSupabaseUser));
+  await upsertSupabaseUsers(rows);
 }
 
-export async function deleteUserFromSupabase(id: string): Promise<void> {
+export async function deleteUserFromSupabase(id: string, email?: string): Promise<void> {
   await deleteSupabaseRow('users', id);
+  const emailLower = email?.trim().toLowerCase();
+  if (emailLower) {
+    await deleteSupabaseWhere(
+      'users',
+      `email=eq.${encodeURIComponent(emailLower)}&id=neq.user-owner`
+    );
+  }
 }
 
 export async function syncCollaboratorToSupabase(row: CollaboratorRow | undefined): Promise<void> {
@@ -560,7 +728,45 @@ export async function syncAccessRequestToSupabase(
   row: AccessRequestRow | undefined
 ): Promise<void> {
   if (!row) return;
-  await upsertSupabaseRows('access_requests', [toSupabaseAccessRequest(row)]);
+  const ok = await upsertSupabaseRows('access_requests', [toSupabaseAccessRequest(row)]);
+  if (ok) return;
+
+  const config = ensureWritableConfig();
+  if (!config) return;
+  try {
+    const res = await fetch(
+      `${config.url}/rest/v1/managed_lists?id=eq.access_requests_store&limit=1`,
+      {
+        method: 'GET',
+        headers: buildHeaders(config.key),
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    const existingRows = res.ok
+      ? ((await res.json().catch(() => [])) as Array<Record<string, unknown>>)
+      : [];
+    const currentList =
+      existingRows[0] && Array.isArray(existingRows[0].groups)
+        ? (existingRows[0].groups as Array<Record<string, unknown>>)
+        : [];
+    const mapped = toSupabaseAccessRequest(row);
+    const nextList = [
+      mapped,
+      ...currentList.filter((item) => String(item.id || '') !== row.id),
+    ];
+    await upsertSupabaseRows('managed_lists', [
+      {
+        id: 'access_requests_store',
+        groups: nextList,
+        roles: [],
+        destinations: [],
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+    ]);
+  } catch {
+    // Non-fatal fallback sync
+  }
 }
 
 export interface RemotePendingAccessRequest {
@@ -848,7 +1054,7 @@ async function runPullFromSupabaseToCloudSql(config: SupabaseConfig): Promise<bo
       const localLists = await tx.select().from(managedLists);
       const listsById = new Map(localLists.map((l) => [l.id, l]));
       for (const r of listsRes.rows) {
-        if (typeof r.id !== 'string') continue;
+        if (typeof r.id !== 'string' || r.id === 'access_requests_store') continue;
         const local = listsById.get(r.id);
         const groups = toStringArray(r.groups);
         const roles = toStringArray(r.roles);
@@ -893,7 +1099,12 @@ async function runPullFromSupabaseToCloudSql(config: SupabaseConfig): Promise<bo
         const emailLower = r.email.trim().toLowerCase();
         if (!emailLower) continue;
 
-        const local = userById.get(r.id) ?? userByEmail.get(emailLower);
+        const byId = userById.get(r.id);
+        const byEmail = userByEmail.get(emailLower);
+        const local =
+          byId && (!byEmail || byEmail.id === byId.id)
+            ? byId
+            : byEmail ?? byId;
         const rawUid = typeof r.uid === 'string' && r.uid.trim() ? r.uid.trim() : null;
         const conflictingUidOwner = rawUid ? userByUid.get(rawUid) : undefined;
         const safeUid =
@@ -935,11 +1146,15 @@ async function runPullFromSupabaseToCloudSql(config: SupabaseConfig): Promise<bo
           (!local.uid && Boolean(safeUid))
         ) {
           const nextUid = safeUid ?? local.uid ?? null;
+          const emailConflictOwner = userByEmail.get(emailLower);
+          const safeEmail =
+            !emailConflictOwner || emailConflictOwner.id === local.id ? emailLower : local.email;
           const updated = await tx
             .update(users)
             .set({
               uid: nextUid,
               name: typeof r.name === 'string' ? r.name : local.name,
+              email: safeEmail,
               role: typeof r.role === 'string' ? r.role : local.role,
               department: typeof r.department === 'string' ? r.department : local.department,
               isAdmin: Boolean(r.is_admin),
@@ -1221,11 +1436,17 @@ async function runPullFromSupabaseToCloudSql(config: SupabaseConfig): Promise<bo
         }
       }
 
-      // 10. Access requests
-      if (accReqsRes.rows.length > 0) {
+      // 10. Access requests (from table or fallback store in managed_lists)
+      const storeRow = listsRes.rows.find((r) => r.id === 'access_requests_store');
+      const fallbackAccRows =
+        storeRow && Array.isArray(storeRow.groups)
+          ? (storeRow.groups as Array<Record<string, unknown>>)
+          : [];
+      const mergedAccRows = [...accReqsRes.rows, ...fallbackAccRows];
+      if (mergedAccRows.length > 0) {
         const localAccReqs = await tx.select().from(accessRequests);
         const accReqMap = new Map(localAccReqs.map((a) => [a.id, a]));
-        for (const r of accReqsRes.rows) {
+        for (const r of mergedAccRows) {
           if (typeof r.id !== 'string' || typeof r.email !== 'string') continue;
           const emailLower = r.email.trim().toLowerCase();
           const local = accReqMap.get(r.id);
@@ -1335,7 +1556,7 @@ export async function syncAllTablesToSupabase(): Promise<boolean> {
 
     const parentResults = await Promise.all([
       upsertSupabaseRows('managed_lists', listsRows.map(toSupabaseManagedLists)),
-      upsertSupabaseRows('users', userRows.map(toSupabaseUser)),
+      upsertSupabaseUsers(userRows),
       upsertSupabaseRows('collaborators', collabRows.map(toSupabaseCollaborator)),
       upsertSupabaseRows('products', prodRows.map(toSupabaseProduct), 10),
     ]);
@@ -1403,6 +1624,7 @@ export async function syncResetAllToSupabase(params: {
   await deleteSupabaseWhere('deletion_requests', 'id=not.is.null');
   await deleteSupabaseWhere('deletion_logs', 'id=not.is.null');
   await deleteSupabaseWhere('access_requests', 'id=not.is.null');
+  await deleteSupabaseWhere('managed_lists', 'id=eq.access_requests_store');
   await deleteSupabaseWhere('collaborators', 'id=not.is.null');
   await deleteSupabaseWhere('products', 'id=not.is.null');
   await deleteSupabaseWhere('users', 'id=neq.user-owner');

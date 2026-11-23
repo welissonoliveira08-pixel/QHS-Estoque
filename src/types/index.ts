@@ -4,6 +4,7 @@ export type TabId =
   | 'entradas'
   | 'saidas'
   | 'colaboradores'
+  | 'destinos'
   | 'relatorios'
   | 'estatisticas'
   | 'configuracoes';
@@ -14,6 +15,7 @@ export interface UserPermissions {
   entradas: boolean;
   saidas: boolean;
   colaboradores: boolean;
+  destinos: boolean;
   relatorios: boolean;
   estatisticas: boolean;
   configuracoes: boolean;
